@@ -8,3 +8,5 @@ edition = "2018"
 
 [dependencies]
 portaudio = "0.7.0"
+gnuplot = "0.0.37"
+num = "0.2.0"

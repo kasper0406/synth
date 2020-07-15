@@ -1,9 +1,16 @@
 extern crate portaudio;
 
+mod fft;
+use num::complex::Complex;
+use num::Zero;
+
 use portaudio as pa;
 use std::thread;
 use std::time;
 use std::f64::consts::PI;
+
+use gnuplot as plot;
+use gnuplot::AxesCommon;
 
 const SAMPLE_RATE: f64 = 48_000.0;
 const FRAMES_PER_BUFFER: u32 = 256;
@@ -11,20 +18,96 @@ const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
 const VOLUME: f32 = 0.2;
 
-struct Synth {
+trait Wave {
+    // x should be in range [0, 1)
+    fn sample(&self, x: f64) -> f64;
+}
+
+struct SineWave {}
+
+impl Wave for SineWave {
+    fn sample(&self, x: f64) -> f64 {
+        (x * 2f64 * PI).sin()
+    }
+}
+
+struct SawtoothWave {}
+
+impl Wave for SawtoothWave {
+    fn sample(&self, x: f64) -> f64 {
+        (x - 0.5) * 2f64
+    }
+}
+
+struct SquareWave {}
+
+impl Wave for SquareWave {
+    fn sample(&self, x: f64) -> f64 {
+        if x < 0.5 {
+            1f64
+        } else {
+            -1f64
+        }
+    }
+}
+
+struct MemorizedWave {
     waveform: Vec<f64>,
+}
+
+impl MemorizedWave {
+    fn new(wave: &Wave, num_samples: usize) -> MemorizedWave {
+        let mut waveform = vec![0f64; num_samples];
+        for i in 0..num_samples {
+            waveform[i] = wave.sample((i as f64) / (num_samples as f64));
+        }
+        MemorizedWave { waveform }
+    }
+}
+
+impl Wave for MemorizedWave {
+    fn sample(&self, x: f64) -> f64 {
+        self.waveform[(x * self.waveform.len() as f64) as usize]
+    }
+}
+
+struct AliasedWave {
+    coefficients: Vec<Complex<f64>>,
+}
+
+impl AliasedWave {
+    fn new(wave: &Wave, num_samples: usize) -> AliasedWave {
+        let mut waveform = vec![0f64; num_samples];
+        for i in 0..num_samples {
+            waveform[i] = wave.sample((i as f64) / (num_samples as f64));
+        }
+        let coefficients = fft::naive_dft(&waveform);
+        println!("Coefficients: {:?}", coefficients);
+        AliasedWave { coefficients }
+    }
+}
+
+impl Wave for AliasedWave {
+    fn sample(&self, x: f64) -> f64 {
+        let mut result = Complex::<f64>::zero();
+        let N = self.coefficients.len();
+        for k in 0..N {
+            let exp = Complex::<f64>::new(0.0, 2.0 * PI * (k as f64) * x);
+            result += self.coefficients[k] * exp.exp();
+        }
+        result.re
+    }
+}
+
+struct Synth {
+    wave: Box<Wave>,
     phase: f64
 }
 
 impl Synth {
     fn new() -> Synth {
-        const FIDELITY: usize = 500;
-        let mut waveform = vec![0f64; FIDELITY];
-        for i in 0..FIDELITY {
-            waveform[i] = (((i as f64) / (FIDELITY as f64)) * 2f64 * PI).sin();
-        }
-
-        Synth { waveform, phase: 0f64 }
+        let wave = MemorizedWave::new(&SineWave {}, 512);
+        Synth { wave: Box::new(wave), phase: 0f64 }
     }
 
     fn callback(&mut self, args: pa::stream::OutputCallbackArgs<f32>) -> pa::stream::CallbackResult {
@@ -34,8 +117,8 @@ impl Synth {
         let target = 262f64;
 
         for i in 0..frames {
-            buffer[i * 2] = self.waveform[(self.phase * self.waveform.len() as f64) as usize] as f32;
-            buffer[i * 2 + 1] = self.waveform[(self.phase * self.waveform.len() as f64) as usize] as f32;
+            buffer[i * 2] = self.wave.sample(self.phase) as f32;
+            buffer[i * 2 + 1] = self.wave.sample(self.phase) as f32;
 
             self.phase += target / SAMPLE_RATE;
             if self.phase >= 1f64 {
@@ -48,11 +131,12 @@ impl Synth {
             buffer[i * 2] *= VOLUME;
             buffer[i * 2 + 1] *= VOLUME;
 
+            // Clipping
             if buffer[i * 2] > VOLUME {
-                buffer[i * 2] = 0f32;
+                buffer[i * 2] = VOLUME;
             }
             if buffer[i * 2 + 1] > VOLUME {
-                buffer[i * 2 + 1] = 0f32;
+                buffer[i * 2 + 1] = VOLUME;
             }
         }
 
@@ -60,7 +144,62 @@ impl Synth {
     }
 }
 
+fn plot(waves: &[&Wave]) {
+    const SAMPLES: usize = 512;
+    let mut sampled_waves = Vec::with_capacity(waves.len());
+
+    for wave in waves {
+        let mut x: Vec<f64> = Vec::with_capacity(SAMPLES);
+        let mut y: Vec<f64> = Vec::with_capacity(SAMPLES);
+
+        for i in 0..SAMPLES {
+            let a = (i as f64) / (SAMPLES as f64);
+            x.push(a);
+            y.push(wave.sample(a));
+        }
+
+        sampled_waves.push((x, y));
+    }
+
+    let mut figure = plot::Figure::new();
+    let axes = figure.axes2d()
+        .set_title("Signal plot", &[])
+        .set_x_label("Time", &[])
+        .set_y_label("Amplitude", &[]);
+    
+    let colors = ["red", "web-green", "web-blue", "dark-orange", "orange", "dark-yellow"]
+        .iter()
+        .map(|color| plot::Color(*color))
+        .cycle();
+
+    for (i, ((x, y), color)) in sampled_waves.iter().zip(colors).enumerate() {
+        axes.points(x, y, &[plot::Caption(&format!("Wave {}", i)), color]);
+    }
+
+    figure.show().unwrap();
+}
+
 fn main() {
+    /*
+    plot(&[
+        &SineWave {},
+        &MemorizedWave::new(&SineWave {}, 100),
+        &AliasedWave::new(&SineWave {}, 256),
+    ]); */
+
+    /*
+    plot(&[
+        &SquareWave {},
+        &MemorizedWave::new(&SquareWave {}, 100),
+        &AliasedWave::new(&SquareWave {}, 128),
+    ]); */
+
+    plot(&[
+        &SawtoothWave {},
+        &MemorizedWave::new(&SawtoothWave {}, 100),
+        &AliasedWave::new(&SawtoothWave {}, 256),
+    ]);
+
     let pa = pa::PortAudio::new().unwrap();
     println!("PortAudio version: {}", pa.version());
 

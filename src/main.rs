@@ -17,6 +17,7 @@ const FRAMES_PER_BUFFER: u32 = 256;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
 const VOLUME: f32 = 0.2;
+const LIMIT: f32 = 0.3;
 
 trait Wave {
     // x should be in range [0, 1)
@@ -73,6 +74,7 @@ impl Wave for MemorizedWave {
 
 struct AliasedWave {
     coefficients: Vec<Complex<f64>>,
+    // waveform: Vec<f64>,
 }
 
 impl AliasedWave {
@@ -82,7 +84,7 @@ impl AliasedWave {
             waveform[i] = wave.sample((i as f64) / (num_samples as f64));
         }
         let coefficients = fft::naive_dft(&waveform);
-        println!("Coefficients: {:?}", coefficients);
+
         AliasedWave { coefficients }
     }
 }
@@ -90,12 +92,12 @@ impl AliasedWave {
 impl Wave for AliasedWave {
     fn sample(&self, x: f64) -> f64 {
         let mut result = Complex::<f64>::zero();
-        let N = self.coefficients.len();
-        for k in 0..N {
+        let n = self.coefficients.len();
+        for k in 0..(n/2) {
             let exp = Complex::<f64>::new(0.0, 2.0 * PI * (k as f64) * x);
             result += self.coefficients[k] * exp.exp();
         }
-        result.re
+        2f64 * result.re
     }
 }
 
@@ -106,7 +108,11 @@ struct Synth {
 
 impl Synth {
     fn new() -> Synth {
-        let wave = MemorizedWave::new(&SineWave {}, 512);
+        // let wave = MemorizedWave::new(&SineWave {}, 512);
+
+        // let wave = MemorizedWave::new(&SawtoothWave {}, 512);
+        let wave = MemorizedWave::new(&AliasedWave::new(&SawtoothWave {}, 16), 512);
+
         Synth { wave: Box::new(wave), phase: 0f64 }
     }
 
@@ -132,11 +138,11 @@ impl Synth {
             buffer[i * 2 + 1] *= VOLUME;
 
             // Clipping
-            if buffer[i * 2] > VOLUME {
-                buffer[i * 2] = VOLUME;
+            if buffer[i * 2] > LIMIT {
+                buffer[i * 2] = LIMIT;
             }
-            if buffer[i * 2 + 1] > VOLUME {
-                buffer[i * 2 + 1] = VOLUME;
+            if buffer[i * 2 + 1] > LIMIT {
+                buffer[i * 2 + 1] = LIMIT;
             }
         }
 
@@ -183,22 +189,22 @@ fn main() {
     /*
     plot(&[
         &SineWave {},
-        &MemorizedWave::new(&SineWave {}, 100),
-        &AliasedWave::new(&SineWave {}, 256),
+        &MemorizedWave::new(&SineWave {}, 256),
+        &AliasedWave::new(&SineWave {}, 8),
     ]); */
+
+    plot(&[
+        &SquareWave {},
+        &MemorizedWave::new(&SquareWave {}, 256),
+        &AliasedWave::new(&SquareWave {}, 32),
+    ]);
 
     /*
     plot(&[
-        &SquareWave {},
-        &MemorizedWave::new(&SquareWave {}, 100),
-        &AliasedWave::new(&SquareWave {}, 128),
-    ]); */
-
-    plot(&[
         &SawtoothWave {},
-        &MemorizedWave::new(&SawtoothWave {}, 100),
-        &AliasedWave::new(&SawtoothWave {}, 256),
-    ]);
+        &MemorizedWave::new(&SawtoothWave {}, 256),
+        &AliasedWave::new(&SawtoothWave {}, 64),
+    ]); */
 
     let pa = pa::PortAudio::new().unwrap();
     println!("PortAudio version: {}", pa.version());

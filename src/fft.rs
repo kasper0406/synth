@@ -219,27 +219,6 @@ fn test_recursive_fft() {
 }
 
 #[test]
-fn test_recursive_odd_size_fft() {
-    let description = vec![
-        SignalDescription { frequency: 3, amplitude: 1f64, offset: 0f64 },
-        // SignalDescription { frequency: 43, amplitude: 5f64, offset: 0.1337f64 },
-        // SignalDescription { frequency: 24, amplitude: 10f64, offset: 1.437f64 }
-    ];
-
-    let sample_rates: [usize; 8] = [7, 10, 100, 150, 200, 240, 851, 1523];
-    for sample_rate in &sample_rates {
-        println!("Test with sample rate: {}", sample_rate);
-        let interval = 1.0; // seconds
-        let samples = sample(interval, *sample_rate, &description);
-
-        let dft_coefficients = naive_dft(&samples);
-        let fft_coefficients = recursive_fft(&samples);
-
-        validate_coefficients(&fft_coefficients, &dft_coefficients);
-    }
-}
-
-#[test]
 fn test_iterative_fft() {
     let description = vec![
         SignalDescription { frequency: 6, amplitude: 1f64, offset: 0f64 },

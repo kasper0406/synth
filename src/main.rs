@@ -9,6 +9,15 @@ use std::thread;
 use std::time;
 use std::f64::consts::PI;
 
+use std::ptr;
+
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::Ordering;
+use std::thread::JoinHandle;
+use std::sync::mpsc;
+
 use gnuplot as plot;
 use gnuplot::AxesCommon;
 
@@ -17,7 +26,7 @@ const FRAMES_PER_BUFFER: u32 = 256;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
 const VOLUME: f32 = 0.2;
-const LIMIT: f32 = 0.3;
+const LIMIT: f32 = 0.5;
 
 trait Wave {
     // x should be in range [0, 1)
@@ -74,7 +83,6 @@ impl Wave for MemorizedWave {
 
 struct AliasedWave {
     coefficients: Vec<Complex<f64>>,
-    // waveform: Vec<f64>,
 }
 
 impl AliasedWave {
@@ -101,49 +109,122 @@ impl Wave for AliasedWave {
     }
 }
 
+struct MaterializedSignal {
+    frequency: f64,
+    wave: MemorizedWave,
+
+    current_phase: f64,
+}
+
+impl MaterializedSignal {
+    #[inline(always)]
+    fn sample(&mut self, rate: f64) -> f64 {
+        let result = self.wave.sample(self.current_phase);
+        self.current_phase += self.frequency / SAMPLE_RATE;
+        if self.current_phase >= 1f64 {
+            self.current_phase -= 1f64;
+            if self.current_phase < 0f64 {
+                self.current_phase = 0f64;
+            }
+        }
+
+        result
+    }
+}
+
+impl Drop for MaterializedSignal {
+    fn drop(&mut self) {
+        println!("Dropping materialized signal at freq {}", self.frequency);
+    }
+}
+
+struct MaterializedSignals {
+    signals: Vec<MaterializedSignal>,
+}
+
+macro_rules! join_thread {
+    ($x:expr) => {
+        if let Some(thread) = $x.take() {
+            thread.join().unwrap();
+        }
+    };
+}
+
 struct Synth {
-    wave: Box<Wave>,
-    phase: f64
+    signal_receiver: mpsc::Receiver<MaterializedSignal>,
+    current_signal: MaterializedSignal,
+
+    is_running: Arc<AtomicBool>,
+    gc_thread: Option<JoinHandle<()>>,
+    gc_reclaim_send: mpsc::Sender<MaterializedSignal>,
+}
+
+impl Drop for Synth {
+    fn drop(&mut self) {
+        self.is_running.store(false, Ordering::SeqCst);
+        join_thread!(self.gc_thread);
+    }
 }
 
 impl Synth {
-    fn new() -> Synth {
-        // let wave = MemorizedWave::new(&SineWave {}, 512);
+    fn new(signal_receiver: mpsc::Receiver<MaterializedSignal>) -> Synth {
+        let is_running = Arc::new(AtomicBool::new(true));
+        let gc_running = is_running.clone();
 
-        // let wave = MemorizedWave::new(&SawtoothWave {}, 512);
-        let wave = MemorizedWave::new(&AliasedWave::new(&SawtoothWave {}, 16), 512);
+        let (gc_reclaim_send, gc_reclaim_recv) = mpsc::channel();
+        let gc_thread = Some(thread::spawn(move || {
+            while (*gc_running).load(Ordering::SeqCst) {
+                if let Ok(garbage) = gc_reclaim_recv.recv_timeout(time::Duration::from_millis(250)) {
+                    std::mem::drop(garbage);
+                }
+            }
+        }));
 
-        Synth { wave: Box::new(wave), phase: 0f64 }
+        let zero_wave = MemorizedWave {
+            waveform: vec![0f64],
+        };
+        
+        let zero_signal = MaterializedSignal {
+            frequency: 0f64,
+            current_phase: 0f64,
+            wave: zero_wave
+        };
+
+        Synth {
+            signal_receiver,
+            current_signal: zero_signal,
+            is_running,
+            gc_thread,
+            gc_reclaim_send,
+        }
     }
 
     fn callback(&mut self, args: pa::stream::OutputCallbackArgs<f32>) -> pa::stream::CallbackResult {
         let frames = args.frames;
         let buffer = args.buffer;
 
-        let target = 262f64;
+        if let Ok(mut new_signal) = self.signal_receiver.try_recv() {
+            std::mem::swap(&mut self.current_signal, &mut new_signal);
+            self.gc_reclaim_send.send(new_signal).unwrap();
+        }
 
         for i in 0..frames {
-            buffer[i * 2] = self.wave.sample(self.phase) as f32;
-            buffer[i * 2 + 1] = self.wave.sample(self.phase) as f32;
+            let output = self.current_signal.sample(SAMPLE_RATE);
 
-            self.phase += target / SAMPLE_RATE;
-            if self.phase >= 1f64 {
-                self.phase -= 1f64;
-                if self.phase < 0f64 {
-                    self.phase = 0f64;
-                }
-            }
+            buffer[i * 2] = output as f32;
+            buffer[i * 2 + 1] = output as f32;
 
             buffer[i * 2] *= VOLUME;
             buffer[i * 2 + 1] *= VOLUME;
 
+            /*
             // Clipping
             if buffer[i * 2] > LIMIT {
                 buffer[i * 2] = LIMIT;
             }
             if buffer[i * 2 + 1] > LIMIT {
                 buffer[i * 2 + 1] = LIMIT;
-            }
+            } */
         }
 
         pa::stream::CallbackResult::Continue
@@ -185,6 +266,57 @@ fn plot(waves: &[&Wave]) {
     figure.show().unwrap();
 }
 
+type FrequencyResponse = Fn(f64) -> f64;
+
+struct Signal {
+    wave: AliasedWave,
+    frequency: f64,
+}
+
+impl Signal {
+    fn materialize(&self) -> MaterializedSignal {
+        MaterializedSignal {
+            frequency: self.frequency,
+            current_phase: 0f64,
+            wave: MemorizedWave::new(&self.wave, 1024)
+        }
+    }
+}
+
+/*
+struct Filter {
+    signals: Vec<Signals>,
+    func: FrequencyResponse, // Frequency response map
+}
+
+impl Filter {
+    fn apply(&self, signal: SignalDescription) -> SignalDescription {
+       
+    }
+} */
+
+fn test_synth(sender: mpsc::Sender<MaterializedSignal>) {
+    let wave1 = MemorizedWave::new(&SineWave {}, 512);
+    let mut signal1 = MaterializedSignal {
+        frequency: 261.63,
+        current_phase: 0f64,
+        wave: wave1
+    };
+    sender.send(signal1);
+
+    thread::sleep(time::Duration::from_secs(1));
+
+    let wave2 = MemorizedWave::new(&SineWave {}, 512);
+    let mut signal2 = MaterializedSignal {
+        frequency: 392.00,
+        current_phase: 0f64,
+        wave: wave2
+    };
+    sender.send(signal2);
+
+    thread::sleep(time::Duration::from_secs(1));
+}
+
 fn main() {
     /*
     plot(&[
@@ -193,11 +325,12 @@ fn main() {
         &AliasedWave::new(&SineWave {}, 8),
     ]); */
 
+    /*
     plot(&[
         &SquareWave {},
         &MemorizedWave::new(&SquareWave {}, 256),
         &AliasedWave::new(&SquareWave {}, 32),
-    ]);
+    ]);*/
 
     /*
     plot(&[
@@ -217,12 +350,13 @@ fn main() {
     let params = pa::stream::Parameters::new(output_device, CHANNELS as i32, INTERLEAVED, output_info.default_low_output_latency);
     let settings = pa::stream::OutputSettings::new(params, SAMPLE_RATE, FRAMES_PER_BUFFER);
 
-    let mut synth = Synth::new();
+    let (signal_sender, signal_receiver) = mpsc::channel();
+    let mut synth = Synth::new(signal_receiver);
 
     let mut stream = pa.open_non_blocking_stream(settings, move |args| synth.callback(args)).unwrap();
     stream.start().unwrap();
 
-    thread::sleep(time::Duration::from_secs(2));
+    test_synth(signal_sender);
 
     stream.stop().unwrap();
 }

@@ -13,7 +13,7 @@ use std::ptr;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
-use std::sync::atomic::AtomicPtr;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::sync::mpsc;
@@ -22,7 +22,7 @@ use gnuplot as plot;
 use gnuplot::AxesCommon;
 
 const SAMPLE_RATE: f64 = 48_000.0;
-const FRAMES_PER_BUFFER: u32 = 256;
+const FRAMES_PER_BUFFER: u32 = 64;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
 const VOLUME: f32 = 0.2;
@@ -150,27 +150,54 @@ macro_rules! join_thread {
     };
 }
 
+struct CallbackStats {
+    num_completed: Arc<AtomicUsize>,
+
+    // All times in nanoseconds
+    max_time: Arc<AtomicUsize>,
+    combined_time: Arc<AtomicUsize>,
+}
+
+impl CallbackStats {
+    fn new() -> CallbackStats {
+        CallbackStats {
+            num_completed: Arc::new(AtomicUsize::new(0)),
+            max_time: Arc::new(AtomicUsize::new(0)),
+            combined_time: Arc::new(AtomicUsize::new(0)),
+        }
+    }
+}
+
 struct Synth {
+    // Signal handling
     signal_receiver: mpsc::Receiver<MaterializedSignal>,
     current_signal: MaterializedSignal,
 
-    is_running: Arc<AtomicBool>,
+    // Signal cleanup handling
     gc_thread: Option<JoinHandle<()>>,
     gc_reclaim_send: mpsc::Sender<MaterializedSignal>,
+
+    // Callback monitoring handling
+    callback_stats: CallbackStats,
+    monitoring_thread: Option<JoinHandle<()>>,
+
+    // Generic
+    is_running: Arc<AtomicBool>,
 }
 
 impl Drop for Synth {
     fn drop(&mut self) {
         self.is_running.store(false, Ordering::SeqCst);
         join_thread!(self.gc_thread);
+        join_thread!(self.monitoring_thread);
     }
 }
 
 impl Synth {
     fn new(signal_receiver: mpsc::Receiver<MaterializedSignal>) -> Synth {
         let is_running = Arc::new(AtomicBool::new(true));
-        let gc_running = is_running.clone();
 
+        let gc_running = is_running.clone();
         let (gc_reclaim_send, gc_reclaim_recv) = mpsc::channel();
         let gc_thread = Some(thread::spawn(move || {
             while (*gc_running).load(Ordering::SeqCst) {
@@ -180,10 +207,33 @@ impl Synth {
             }
         }));
 
+        let callback_stats = CallbackStats::new();
+        let monitoring_running = is_running.clone();
+        let monitoring_cb_completed = callback_stats.num_completed.clone();
+        let monitoring_combined_time = callback_stats.combined_time.clone();
+        let monitoring_max_time = callback_stats.max_time.clone();
+        let monitoring_thread = Some(thread::spawn(move || {
+            let mut prev_time = time::Instant::now();
+            while (*monitoring_running).load(Ordering::SeqCst) {
+                thread::sleep(time::Duration::from_secs(1));
+                // Theres a bit of data race in these numbers, but it will give a rough idea of performance
+                let num_completed = monitoring_cb_completed.fetch_and(0, Ordering::Relaxed);
+                let combined_time = monitoring_combined_time.fetch_and(0, Ordering::Relaxed);
+                let max_time = monitoring_max_time.fetch_and(0, Ordering::Relaxed);
+
+                let after_time = time::Instant::now();
+                let duration = after_time.duration_since(prev_time);
+                prev_time = after_time;
+
+                println!("{} callbacks completed in {:?}, combined cb time {} ms, max cb execution {} us",
+                    num_completed, duration, combined_time / 1000000, max_time / 1000);
+            }
+        }));
+
         let zero_wave = MemorizedWave {
             waveform: vec![0f64],
         };
-        
+
         let zero_signal = MaterializedSignal {
             frequency: 0f64,
             current_phase: 0f64,
@@ -196,10 +246,14 @@ impl Synth {
             is_running,
             gc_thread,
             gc_reclaim_send,
+            callback_stats,
+            monitoring_thread,
         }
     }
 
     fn callback(&mut self, args: pa::stream::OutputCallbackArgs<f32>) -> pa::stream::CallbackResult {
+        let start_time = time::Instant::now();
+
         let frames = args.frames;
         let buffer = args.buffer;
 
@@ -226,6 +280,12 @@ impl Synth {
                 buffer[i * 2 + 1] = LIMIT;
             } */
         }
+
+        // Update monitoring
+        let elapsed = start_time.elapsed().as_nanos() as usize;
+        self.callback_stats.num_completed.fetch_add(1, Ordering::Relaxed);
+        self.callback_stats.max_time.fetch_max(elapsed, Ordering::Relaxed);
+        self.callback_stats.combined_time.fetch_add(elapsed, Ordering::Relaxed);
 
         pa::stream::CallbackResult::Continue
     }
@@ -304,7 +364,7 @@ fn test_synth(sender: mpsc::Sender<MaterializedSignal>) {
     };
     sender.send(signal1);
 
-    thread::sleep(time::Duration::from_secs(1));
+    thread::sleep(time::Duration::from_secs(3));
 
     let wave2 = MemorizedWave::new(&SineWave {}, 512);
     let mut signal2 = MaterializedSignal {
@@ -314,7 +374,7 @@ fn test_synth(sender: mpsc::Sender<MaterializedSignal>) {
     };
     sender.send(signal2);
 
-    thread::sleep(time::Duration::from_secs(1));
+    thread::sleep(time::Duration::from_secs(3));
 }
 
 fn main() {

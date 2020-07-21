@@ -9,8 +9,6 @@ use std::thread;
 use std::time;
 use std::f64::consts::PI;
 
-use std::ptr;
-
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicUsize;
@@ -112,23 +110,13 @@ impl Wave for AliasedWave {
 struct MaterializedSignal {
     frequency: f64,
     wave: MemorizedWave,
-
-    current_phase: f64,
 }
 
 impl MaterializedSignal {
     #[inline(always)]
-    fn sample(&mut self, rate: f64) -> f64 {
-        let result = self.wave.sample(self.current_phase);
-        self.current_phase += self.frequency / SAMPLE_RATE;
-        if self.current_phase >= 1f64 {
-            self.current_phase -= 1f64;
-            if self.current_phase < 0f64 {
-                self.current_phase = 0f64;
-            }
-        }
-
-        result
+    fn sample(&self, sample_idx: u64, rate: f64) -> f64 {
+        let phase = ((sample_idx as f64) * self.frequency / rate).fract();
+        self.wave.sample(phase)
     }
 }
 
@@ -169,13 +157,15 @@ impl CallbackStats {
 }
 
 struct Synth {
+    sample_count: u64, // More than enough to never overflow
+
     // Signal handling
-    signal_receiver: mpsc::Receiver<MaterializedSignal>,
-    current_signal: MaterializedSignal,
+    signal_receiver: mpsc::Receiver<MaterializedSignals>,
+    current_signal: MaterializedSignals,
 
     // Signal cleanup handling
     gc_thread: Option<JoinHandle<()>>,
-    gc_reclaim_send: mpsc::Sender<MaterializedSignal>,
+    gc_reclaim_send: mpsc::Sender<MaterializedSignals>,
 
     // Callback monitoring handling
     callback_stats: CallbackStats,
@@ -194,7 +184,7 @@ impl Drop for Synth {
 }
 
 impl Synth {
-    fn new(signal_receiver: mpsc::Receiver<MaterializedSignal>) -> Synth {
+    fn new(signal_receiver: mpsc::Receiver<MaterializedSignals>) -> Synth {
         let is_running = Arc::new(AtomicBool::new(true));
 
         let gc_running = is_running.clone();
@@ -230,17 +220,12 @@ impl Synth {
             }
         }));
 
-        let zero_wave = MemorizedWave {
-            waveform: vec![0f64],
-        };
-
-        let zero_signal = MaterializedSignal {
-            frequency: 0f64,
-            current_phase: 0f64,
-            wave: zero_wave
+        let zero_signal = MaterializedSignals {
+            signals: vec![]
         };
 
         Synth {
+            sample_count: 0,
             signal_receiver,
             current_signal: zero_signal,
             is_running,
@@ -263,7 +248,10 @@ impl Synth {
         }
 
         for i in 0..frames {
-            let output = self.current_signal.sample(SAMPLE_RATE);
+            let mut output = 0f64;
+            for signal in &self.current_signal.signals {
+                output += signal.sample(self.sample_count, SAMPLE_RATE);
+            }
 
             buffer[i * 2] = output as f32;
             buffer[i * 2 + 1] = output as f32;
@@ -279,6 +267,8 @@ impl Synth {
             if buffer[i * 2 + 1] > LIMIT {
                 buffer[i * 2 + 1] = LIMIT;
             } */
+
+            self.sample_count += 1;
         }
 
         // Update monitoring
@@ -337,7 +327,6 @@ impl Signal {
     fn materialize(&self) -> MaterializedSignal {
         MaterializedSignal {
             frequency: self.frequency,
-            current_phase: 0f64,
             wave: MemorizedWave::new(&self.wave, 1024)
         }
     }
@@ -355,22 +344,31 @@ impl Filter {
     }
 } */
 
-fn test_synth(sender: mpsc::Sender<MaterializedSignal>) {
-    let wave1 = MemorizedWave::new(&SineWave {}, 512);
-    let mut signal1 = MaterializedSignal {
-        frequency: 261.63,
-        current_phase: 0f64,
-        wave: wave1
+fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
+    let mut signals = vec![];
+    for i in 0..100 {
+        let wave = MemorizedWave::new(&SineWave {}, 512);
+        signals.push(MaterializedSignal {
+            frequency: 7902.13 / (i + 1) as f64,
+            wave: wave
+        });
+    }
+
+    let signal1 = MaterializedSignals {
+        signals
     };
     sender.send(signal1);
 
     thread::sleep(time::Duration::from_secs(3));
 
     let wave2 = MemorizedWave::new(&SineWave {}, 512);
-    let mut signal2 = MaterializedSignal {
-        frequency: 392.00,
-        current_phase: 0f64,
-        wave: wave2
+    let signal2 = MaterializedSignals {
+        signals: vec![
+            MaterializedSignal {
+                frequency: 392.00,
+                wave: wave2
+            }
+        ],
     };
     sender.send(signal2);
 

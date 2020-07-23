@@ -281,6 +281,107 @@ impl Synth {
     }
 }
 
+trait Filter {
+    fn apply(&self, frequency: f64) -> f64;
+}
+
+struct Signal {
+    wave: AliasedWave,
+    frequency: f64,
+}
+
+impl Signal {
+    fn materialize(&self) -> MaterializedSignal {
+        MaterializedSignal {
+            frequency: self.frequency,
+            wave: MemorizedWave::new(&self.wave, 1024)
+        }
+    }
+}
+
+impl Signal {
+    fn apply_filter<F: Filter>(&self, filter: &F) -> Signal {
+        let mut coefficients = self.wave.coefficients.clone();
+        for i in 0..coefficients.len() {
+            coefficients[i] = filter.apply(self.frequency * (i as f64)) * coefficients[i];
+        }
+
+        let wave = AliasedWave { coefficients };
+        Signal {
+            wave,
+            frequency: self.frequency,
+        }
+    }
+}
+
+struct Envelope {
+    attack_filter_supplier: Box<Fn(f64) -> Filter>, // Function defined on [0;1] interval
+    attack_duration: f64, // Time it takes for attack filter to be called uniformly through [0;1]
+
+    sustain_filter_supplier: Box<Fn(f64) -> Filter>,
+    sustain_duration: f64,
+
+    decay_filter_supplier: Box<Fn(f64) -> Filter>,
+    decay_duration: f64,
+}
+
+struct LowpassFilter {
+    cutoff: f64,
+}
+impl Filter for LowpassFilter {
+    fn apply(&self, frequency: f64) -> f64 {
+        if frequency < self.cutoff {
+            1f64
+        } else {
+            0f64
+        }
+    }
+}
+
+struct SignalPipeline<F: Filter> {
+    filters: Vec<F>,
+}
+
+impl<F: Filter> SignalPipeline<F> {
+    fn new(filters: Vec<F>) -> SignalPipeline<F> {
+        SignalPipeline { filters }
+    }
+
+    fn process_one(&self, signal: &Signal) -> MaterializedSignal {
+        let mut filtered_signal = signal;
+
+        // TODO(knielsen): Consider optimizing this filter by applying all filters together instead of allocating new coefficients for all of them
+        let mut owner;
+        for filter in self.filters.iter() {
+            owner = filtered_signal.apply_filter(filter);
+            filtered_signal = &owner;
+        }
+
+        MaterializedSignal {
+            frequency: filtered_signal.frequency,
+            wave: MemorizedWave::new(&filtered_signal.wave, 512),
+        }
+    }
+}
+
+fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
+    let input = Signal {
+        frequency: 392.00,
+        wave: AliasedWave::new(&SawtoothWave {}, 1024)
+    };
+
+    for i in 0..100 {
+        let pipeline = SignalPipeline::new(vec![
+            LowpassFilter { cutoff: 1000.0 }
+        ]);
+        let output = pipeline.process_one(&input);
+
+        sender.send(MaterializedSignals { signals: vec![output] }).unwrap();
+
+        thread::sleep(time::Duration::from_millis(10));
+    }
+}
+
 fn plot(waves: &[&Wave]) {
     const SAMPLES: usize = 512;
     let mut sampled_waves = Vec::with_capacity(waves.len());
@@ -316,65 +417,6 @@ fn plot(waves: &[&Wave]) {
     figure.show().unwrap();
 }
 
-type FrequencyResponse = Fn(f64) -> f64;
-
-struct Signal {
-    wave: AliasedWave,
-    frequency: f64,
-}
-
-impl Signal {
-    fn materialize(&self) -> MaterializedSignal {
-        MaterializedSignal {
-            frequency: self.frequency,
-            wave: MemorizedWave::new(&self.wave, 1024)
-        }
-    }
-}
-
-/*
-struct Filter {
-    signals: Vec<Signals>,
-    func: FrequencyResponse, // Frequency response map
-}
-
-impl Filter {
-    fn apply(&self, signal: SignalDescription) -> SignalDescription {
-       
-    }
-} */
-
-fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
-    let mut signals = vec![];
-    for i in 0..100 {
-        let wave = MemorizedWave::new(&SineWave {}, 512);
-        signals.push(MaterializedSignal {
-            frequency: 7902.13 / (i + 1) as f64,
-            wave: wave
-        });
-    }
-
-    let signal1 = MaterializedSignals {
-        signals
-    };
-    sender.send(signal1);
-
-    thread::sleep(time::Duration::from_secs(3));
-
-    let wave2 = MemorizedWave::new(&SineWave {}, 512);
-    let signal2 = MaterializedSignals {
-        signals: vec![
-            MaterializedSignal {
-                frequency: 392.00,
-                wave: wave2
-            }
-        ],
-    };
-    sender.send(signal2);
-
-    thread::sleep(time::Duration::from_secs(3));
-}
-
 fn main() {
     /*
     plot(&[
@@ -395,6 +437,25 @@ fn main() {
         &SawtoothWave {},
         &MemorizedWave::new(&SawtoothWave {}, 256),
         &AliasedWave::new(&SawtoothWave {}, 64),
+    ]);*/
+
+    /*
+    let aliased_wave = AliasedWave::new(&SawtoothWave {}, 1024);
+    let signal = Signal {
+        frequency: 1.0,
+        wave: aliased_wave,
+    };
+    let filtered = signal.apply_filter(&|freq| {
+        if freq > 5.0 {
+            0.0f64
+        } else {
+            1.0f64
+        }
+    });
+
+    plot(&[
+        &signal.wave,
+        &filtered.wave,
     ]); */
 
     let pa = pa::PortAudio::new().unwrap();

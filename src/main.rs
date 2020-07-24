@@ -59,6 +59,15 @@ impl Wave for SquareWave {
     }
 }
 
+struct PianoWave {}
+
+impl Wave for PianoWave {
+    fn sample(&self, a: f64) -> f64 {
+        let x = (a - 0.5) * 2.0;
+        -((3.0 * PI * x).sin() / 4.0) + ((PI * x).sin() / 4.0) + ((3.0 as f64).sqrt() * (PI * x).cos()) / 2.0
+    }
+}
+
 struct MemorizedWave {
     waveform: Vec<f64>,
 }
@@ -281,10 +290,6 @@ impl Synth {
     }
 }
 
-trait Filter {
-    fn apply(&self, frequency: f64) -> f64;
-}
-
 struct Signal {
     wave: AliasedWave,
     frequency: f64,
@@ -299,30 +304,26 @@ impl Signal {
     }
 }
 
-impl Signal {
-    fn apply_filter<F: Filter>(&self, filter: &F) -> Signal {
-        let mut coefficients = self.wave.coefficients.clone();
-        for i in 0..coefficients.len() {
-            coefficients[i] = filter.apply(self.frequency * (i as f64)) * coefficients[i];
-        }
-
-        let wave = AliasedWave { coefficients };
-        Signal {
-            wave,
-            frequency: self.frequency,
-        }
-    }
+trait SignalTransformer {
+    fn transform(&self, signal: &Signal) -> Signal;
 }
 
-struct Envelope {
-    attack_filter_supplier: Box<Fn(f64) -> Filter>, // Function defined on [0;1] interval
-    attack_duration: f64, // Time it takes for attack filter to be called uniformly through [0;1]
+trait Filter: SignalTransformer {
+    fn apply(&self, frequency: f64) -> f64;    
+}
 
-    sustain_filter_supplier: Box<Fn(f64) -> Filter>,
-    sustain_duration: f64,
+impl<T: Filter> SignalTransformer for T {
+    fn transform(&self, signal: &Signal) -> Signal {
+        let mut coefficients = signal.wave.coefficients.clone();
+        for i in 0..coefficients.len() {
+            coefficients[i] = self.apply(signal.frequency * (i as f64)) * coefficients[i];
+        }
 
-    decay_filter_supplier: Box<Fn(f64) -> Filter>,
-    decay_duration: f64,
+        Signal {
+            wave: AliasedWave { coefficients },
+            frequency: signal.frequency,
+        }
+    }
 }
 
 struct LowpassFilter {
@@ -338,48 +339,128 @@ impl Filter for LowpassFilter {
     }
 }
 
-struct SignalPipeline<F: Filter> {
-    filters: Vec<F>,
+struct HighpassFilter {
+    cutoff: f64,
+}
+impl Filter for HighpassFilter {
+    fn apply(&self, frequency: f64) -> f64 {
+        if frequency > self.cutoff {
+            1f64
+        } else {
+            0f64
+        }
+    }
 }
 
-impl<F: Filter> SignalPipeline<F> {
-    fn new(filters: Vec<F>) -> SignalPipeline<F> {
-        SignalPipeline { filters }
+struct OvertoneGenerator {
+    overtone_levels: Vec<f64>,
+}
+impl SignalTransformer for OvertoneGenerator {
+    fn transform(&self, signal: &Signal) -> Signal {
+        let mut coefficients = signal.wave.coefficients.clone();
+        for i in 1..coefficients.len() {
+            let tone_value = coefficients[i];
+            for j in 0..self.overtone_levels.len() {
+                let index = i * (j + 2);
+                if index >= coefficients.len() {
+                    break;
+                }
+                coefficients[index] += signal.wave.coefficients[i] * self.overtone_levels[j];
+            }
+        }
+
+        Signal {
+            wave: AliasedWave { coefficients },
+            frequency: signal.frequency,
+        }
+    }
+}
+
+struct DiffuseTransform {
+    iterations: usize,
+    leak_amount: f64,
+}
+
+impl SignalTransformer for DiffuseTransform {
+    fn transform(&self, signal: &Signal) -> Signal {
+        let mut prev = signal.wave.coefficients.clone();
+        let mut next = signal.wave.coefficients.clone();
+
+        for i in 0..self.iterations {
+            for j in 0..next.len() {
+                let left_leak = if j > 0 { prev[j - 1] } else { Complex::<f64>::zero() };
+                let right_leak = if j < prev.len() - 1 { prev[j + 1] } else { Complex::<f64>::zero() };
+                next[j] = prev[j] + self.leak_amount * (left_leak + right_leak);
+            }
+            std::mem::swap(&mut prev, &mut next);
+        }
+
+        Signal {
+            wave: AliasedWave { coefficients: prev },
+            frequency: signal.frequency,
+        }
+    }
+}
+
+struct Envelope {
+    attack_filter_supplier: Box<Fn(f64) -> Filter>, // Function defined on [0;1] interval
+    attack_duration: f64, // Time it takes for attack filter to be called uniformly through [0;1]
+
+    sustain_filter_supplier: Box<Fn(f64) -> Filter>,
+    sustain_duration: f64,
+
+    decay_filter_supplier: Box<Fn(f64) -> Filter>,
+    decay_duration: f64,
+}
+
+struct SignalPipeline {
+    transformers: Vec<Box<dyn SignalTransformer>>,
+}
+
+impl SignalPipeline {
+    fn new(transformers: Vec<Box<dyn SignalTransformer>>) -> SignalPipeline {
+        SignalPipeline { transformers }
     }
 
     fn process_one(&self, signal: &Signal) -> MaterializedSignal {
-        let mut filtered_signal = signal;
+        let mut transformed_signal = signal;
 
-        // TODO(knielsen): Consider optimizing this filter by applying all filters together instead of allocating new coefficients for all of them
         let mut owner;
-        for filter in self.filters.iter() {
-            owner = filtered_signal.apply_filter(filter);
-            filtered_signal = &owner;
+        for transformer in self.transformers.iter() {
+            owner = transformer.transform(transformed_signal);
+            transformed_signal = &owner;
         }
 
         MaterializedSignal {
-            frequency: filtered_signal.frequency,
-            wave: MemorizedWave::new(&filtered_signal.wave, 512),
+            frequency: transformed_signal.frequency,
+            wave: MemorizedWave::new(&transformed_signal.wave, 512),
         }
     }
 }
 
 fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
-    let input = Signal {
-        frequency: 392.00,
-        wave: AliasedWave::new(&SawtoothWave {}, 1024)
-    };
+    let inputs = vec![
+        Signal {
+            frequency: 392.00,
+            wave: AliasedWave::new(&PianoWave {}, 512)
+        },
+    ];
 
-    for i in 0..100 {
+    let mut signals = vec![];
+
+    for input in inputs {
         let pipeline = SignalPipeline::new(vec![
-            LowpassFilter { cutoff: 1000.0 }
+            Box::new(OvertoneGenerator { overtone_levels: vec![0.2, 0.2, 0.2, 0.2] }),
+            Box::new(DiffuseTransform { iterations: 10, leak_amount: 0.05 }),
+            Box::new(LowpassFilter { cutoff: 1000.0 }),
+            Box::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 }),
         ]);
-        let output = pipeline.process_one(&input);
-
-        sender.send(MaterializedSignals { signals: vec![output] }).unwrap();
-
-        thread::sleep(time::Duration::from_millis(10));
+        signals.push(pipeline.process_one(&input));
     }
+
+    sender.send(MaterializedSignals { signals }).unwrap();
+
+    thread::sleep(time::Duration::from_millis(2000));
 }
 
 fn plot(waves: &[&Wave]) {
@@ -420,10 +501,11 @@ fn plot(waves: &[&Wave]) {
 fn main() {
     /*
     plot(&[
-        &SineWave {},
-        &MemorizedWave::new(&SineWave {}, 256),
-        &AliasedWave::new(&SineWave {}, 8),
-    ]); */
+        &PianoWave {},
+        &MemorizedWave::new(&PianoWave {}, 256),
+        &AliasedWave::new(&PianoWave {}, 8),
+    ]);
+    */
 
     /*
     plot(&[

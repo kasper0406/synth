@@ -16,7 +16,7 @@ struct SignalDescription {
  * Sampel datapoints in `interval` seconds doing `samples_rate` Hz sampling.
  * Generate the signal based on `signal_description`
  */
-fn sample(interval: f64, sample_rate: usize, signal_description: &[SignalDescription]) -> Vec<f64> {
+fn sample(interval: f64, sample_rate: usize, signal_description: &[SignalDescription]) -> Vec<Complex<f64>> {
     let measurement_count = (interval * (sample_rate as f64)) as usize;
     assert!(is_power_of_two(measurement_count), "Measurement count should be a power of two!");
 
@@ -30,13 +30,13 @@ fn sample(interval: f64, sample_rate: usize, signal_description: &[SignalDescrip
             measurement += signal.amplitude * f64::sin(2f64 * PI * freq * t + signal.offset);
         }
 
-        measurements.push(measurement);
+        measurements.push(Complex::<f64>::new(measurement, 0.0));
     }
 
     measurements
 }
 
-pub fn naive_dft(samples: &[f64]) -> Vec<Complex<f64>> {
+pub fn naive_dft(samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
     // TODO(knielsen): Add assertion about spacing between measurements
 
     let mut coefficients = Vec::with_capacity(samples.len());
@@ -45,7 +45,7 @@ pub fn naive_dft(samples: &[f64]) -> Vec<Complex<f64>> {
     for j in 0..N {
         let mut c = Complex::<f64>::zero();
         for k in 0..N {
-            let sample = Complex::new(samples[k], 0.0);
+            let sample = samples[k];
             let exponent = Complex::<f64>::new(0.0, -2.0 * PI * ((k * j) as f64) / (N as f64));
 
             c += sample * exponent.exp();
@@ -61,15 +61,15 @@ fn is_power_of_two(n: usize) -> bool {
     return (n != 0) && ((n & (n - 1)) == 0);
 }
 
-pub fn recursive_fft(samples: &[f64]) -> Vec<Complex<f64>> {
+pub fn recursive_fft(samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
     let N = samples.len();
     assert!(is_power_of_two(N), "Samples must be a power of two!");
     if N <= 4 {
         return naive_dft(samples);
     }
 
-    let even_samples: Vec<f64> = samples.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, s)| s.clone()).collect();
-    let odd_samples: Vec<f64> = samples.iter().enumerate().filter(|(i, _)| i % 2 != 0).map(|(_, s)| s.clone()).collect();
+    let even_samples: Vec<Complex<f64>> = samples.iter().enumerate().filter(|(i, _)| i % 2 == 0).map(|(_, s)| s.clone()).collect();
+    let odd_samples: Vec<Complex<f64>> = samples.iter().enumerate().filter(|(i, _)| i % 2 != 0).map(|(_, s)| s.clone()).collect();
 
     let even_coef = recursive_fft(&even_samples);
     let odd_coef = recursive_fft(&odd_samples);
@@ -122,7 +122,7 @@ pub fn generate_permutation(N: usize) -> Vec<usize> {
     recurse(&identity)
 }
 
-pub fn iterative_fft_prepare(samples: &[f64], permutation: &[usize]) -> Vec<f64> {
+pub fn iterative_fft_prepare(samples: &[Complex<f64>], permutation: &[usize]) -> Vec<Complex<f64>> {
     assert!(is_power_of_two(samples.len()), "Samples must be a power of two!");
 
     let mut permuted = Vec::with_capacity(samples.len());
@@ -135,7 +135,7 @@ pub fn iterative_fft_prepare(samples: &[f64], permutation: &[usize]) -> Vec<f64>
 /**
  * Assumes `samples` has been permutated to the correct form
  */
-pub fn iterative_fft(samples: &[f64]) -> Vec<Complex<f64>> {
+pub fn iterative_fft(samples: &[Complex<f64>]) -> Vec<Complex<f64>> {
     let N = samples.len();
     assert!(is_power_of_two(N), "Samples must be a power of two!");
 
@@ -143,7 +143,7 @@ pub fn iterative_fft(samples: &[f64]) -> Vec<Complex<f64>> {
 
     // Base case
     for i in 0..N {
-        cur[i] = Complex::<f64>::new(samples[i], 0.0);
+        cur[i] = samples[i];
     }
 
     // Inductive case
@@ -180,6 +180,15 @@ pub fn iterative_fft(samples: &[f64]) -> Vec<Complex<f64>> {
     }
 
     cur
+}
+
+pub fn inverse_dft<F>(coefficients: &[Complex<f64>], dft: F) -> Vec<Complex<f64>>
+    where F: Fn(&[Complex<f64>]) -> Vec<Complex<f64>>
+{
+    let input: Vec<Complex<f64>> = coefficients.iter().map(|c| c.conj()).collect();
+    let result = dft(&input);
+    let N = Complex::<f64>::new(coefficients.len() as f64, 0.0);
+    result.iter().map(|c| c.conj() * N).collect()
 }
 
 fn validate_coefficients(actual: &[Complex<f64>], expected: &[Complex<f64>]) {
@@ -234,4 +243,28 @@ fn test_iterative_fft() {
     let fft_coefficients = iterative_fft(&iterative_fft_prepare(&samples, &permutation));
 
     validate_coefficients(&fft_coefficients, &dft_coefficients);
+}
+
+#[test]
+fn test_inverse_dft_naive() {
+    let description = vec![
+        SignalDescription { frequency: 6, amplitude: 1f64, offset: 0f64 },
+        SignalDescription { frequency: 500, amplitude: 5f64, offset: 0.1337f64 },
+        SignalDescription { frequency: 248, amplitude: 10f64, offset: 1.437f64 }
+    ];
+
+    let interval = 2.0; // seconds
+    let samples = sample(interval, 1024, &description);
+
+    let dft_coefficients = naive_dft(&samples);
+    let inversed_naive = inverse_dft(&dft_coefficients, naive_dft);
+    validate_coefficients(&samples, &inversed_naive);
+
+    let inversed_fft_recursive = inverse_dft(&dft_coefficients, recursive_fft);
+    validate_coefficients(&samples, &inversed_fft_recursive);
+
+    let permutation = generate_permutation(dft_coefficients.len());
+    let prepared_dtf_coefficients = iterative_fft_prepare(&dft_coefficients, &permutation);
+    let inversed_fft_iterative = inverse_dft(&prepared_dtf_coefficients, iterative_fft);
+    validate_coefficients(&samples, &inversed_fft_iterative);
 }

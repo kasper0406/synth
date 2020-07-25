@@ -94,25 +94,24 @@ struct AliasedWave {
 
 impl AliasedWave {
     fn new(wave: &Wave, num_samples: usize) -> AliasedWave {
-        let mut waveform = vec![0f64; num_samples];
+        let mut waveform = vec![Complex::<f64>::zero(); num_samples];
         for i in 0..num_samples {
-            waveform[i] = wave.sample((i as f64) / (num_samples as f64));
+            waveform[i] = Complex::<f64>::new(wave.sample((i as f64) / (num_samples as f64)), 0.0);
         }
-        let coefficients = fft::naive_dft(&waveform);
+        let coefficients = fft::recursive_fft(&waveform);
 
+        AliasedWave::from_coefficients(coefficients)
+    }
+
+    fn from_coefficients(coefficients: Vec<Complex<f64>>) -> AliasedWave {
         AliasedWave { coefficients }
     }
-}
 
-impl Wave for AliasedWave {
-    fn sample(&self, x: f64) -> f64 {
-        let mut result = Complex::<f64>::zero();
-        let n = self.coefficients.len();
-        for k in 0..(n/2) {
-            let exp = Complex::<f64>::new(0.0, 2.0 * PI * (k as f64) * x);
-            result += self.coefficients[k] * exp.exp();
-        }
-        2f64 * result.re
+    fn materialize(&self) -> MemorizedWave {
+        let samples = fft::inverse_dft(&self.coefficients, fft::recursive_fft);
+        let waveform = samples.iter().map(|c| c.re).collect();
+
+        MemorizedWave { waveform }
     }
 }
 
@@ -299,7 +298,7 @@ impl Signal {
     fn materialize(&self) -> MaterializedSignal {
         MaterializedSignal {
             frequency: self.frequency,
-            wave: MemorizedWave::new(&self.wave, 1024)
+            wave: self.wave.materialize()
         }
     }
 }
@@ -315,12 +314,16 @@ trait Filter: SignalTransformer {
 impl<T: Filter> SignalTransformer for T {
     fn transform(&self, signal: &Signal) -> Signal {
         let mut coefficients = signal.wave.coefficients.clone();
-        for i in 0..coefficients.len() {
-            coefficients[i] = self.apply(signal.frequency * (i as f64)) * coefficients[i];
+
+        let n = coefficients.len();
+        for i in 0..(n / 2) {
+            let scalar = self.apply(signal.frequency * (i as f64));
+            coefficients[i] = scalar * coefficients[i];
+            coefficients[n - i - 1] = scalar * coefficients[n - i - 1];
         }
 
         Signal {
-            wave: AliasedWave { coefficients },
+            wave: AliasedWave::from_coefficients(coefficients),
             frequency: signal.frequency,
         }
     }
@@ -357,7 +360,10 @@ struct OvertoneGenerator {
 }
 impl SignalTransformer for OvertoneGenerator {
     fn transform(&self, signal: &Signal) -> Signal {
-        let mut coefficients = signal.wave.coefficients.clone();
+        let n = signal.wave.coefficients.len();
+        let mut coefficients = vec![Complex::<f64>::zero(); 2 * n];
+
+        /*
         for i in 1..coefficients.len() {
             let tone_value = coefficients[i];
             for j in 0..self.overtone_levels.len() {
@@ -367,11 +373,46 @@ impl SignalTransformer for OvertoneGenerator {
                 }
                 coefficients[index] += signal.wave.coefficients[i] * self.overtone_levels[j];
             }
+        } */
+
+        for i in 0..n {
+            coefficients[2 * i] = signal.wave.coefficients[i];
+        }
+
+        let tone_value_1 = coefficients[2];
+        let tone_value_2 = coefficients[2 * n - 3];
+
+        coefficients[1] += tone_value_1 * self.overtone_levels[0];
+        coefficients[2 * n - 2] += tone_value_2 * self.overtone_levels[0];
+
+        for i in 2..n.min(self.overtone_levels.len()) {
+            coefficients[2 * i] += tone_value_1 * self.overtone_levels[i - 1];
+            coefficients[2 * n - (2 * i) - 1] += tone_value_2 * self.overtone_levels[i - 1];
         }
 
         Signal {
-            wave: AliasedWave { coefficients },
-            frequency: signal.frequency,
+            wave: AliasedWave::from_coefficients(coefficients),
+            frequency: signal.frequency / 2.0,
+        }
+    }
+}
+
+struct BandwidthExpand {
+    expand_exponent: usize
+}
+
+impl SignalTransformer for BandwidthExpand {
+    fn transform(&self, signal: &Signal) -> Signal {
+        let expand_factor = 1 << self.expand_exponent;
+        let mut coefficients = vec![Complex::<f64>::zero(); expand_factor * signal.wave.coefficients.len()];
+
+        for i in 0..signal.wave.coefficients.len() {
+            coefficients[expand_factor * i] = signal.wave.coefficients[i];
+        }
+
+        Signal {
+            wave: AliasedWave::from_coefficients(coefficients),
+            frequency: signal.frequency / (expand_factor as f64),
         }
     }
 }
@@ -396,7 +437,7 @@ impl SignalTransformer for DiffuseTransform {
         }
 
         Signal {
-            wave: AliasedWave { coefficients: prev },
+            wave: AliasedWave::from_coefficients(prev),
             frequency: signal.frequency,
         }
     }
@@ -433,7 +474,7 @@ impl SignalPipeline {
 
         MaterializedSignal {
             frequency: transformed_signal.frequency,
-            wave: MemorizedWave::new(&transformed_signal.wave, 512),
+            wave: transformed_signal.wave.materialize(),
         }
     }
 }
@@ -441,8 +482,8 @@ impl SignalPipeline {
 fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
     let inputs = vec![
         Signal {
-            frequency: 392.00,
-            wave: AliasedWave::new(&PianoWave {}, 512)
+            frequency: 197.0,
+            wave: AliasedWave::new(&SineWave {}, 512)
         },
     ];
 
@@ -450,9 +491,9 @@ fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
 
     for input in inputs {
         let pipeline = SignalPipeline::new(vec![
-            Box::new(OvertoneGenerator { overtone_levels: vec![0.2, 0.2, 0.2, 0.2] }),
-            Box::new(DiffuseTransform { iterations: 10, leak_amount: 0.05 }),
-            Box::new(LowpassFilter { cutoff: 1000.0 }),
+            Box::new(OvertoneGenerator { overtone_levels: vec![0.34, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] }),
+            Box::new(BandwidthExpand { expand_exponent: 5 }),
+            Box::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 }),
             Box::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 }),
         ]);
         signals.push(pipeline.process_one(&input));
@@ -518,7 +559,7 @@ fn main() {
     plot(&[
         &SawtoothWave {},
         &MemorizedWave::new(&SawtoothWave {}, 256),
-        &AliasedWave::new(&SawtoothWave {}, 64),
+        &AliasedWave::new(&SawtoothWave {}, 256).materialize(),
     ]);*/
 
     /*
@@ -527,18 +568,12 @@ fn main() {
         frequency: 1.0,
         wave: aliased_wave,
     };
-    let filtered = signal.apply_filter(&|freq| {
-        if freq > 5.0 {
-            0.0f64
-        } else {
-            1.0f64
-        }
-    });
+    let filtered = LowpassFilter { cutoff: 8.0 }.transform(&signal);
 
     plot(&[
-        &signal.wave,
-        &filtered.wave,
-    ]); */
+        &signal.wave.materialize(),
+        &filtered.wave.materialize(),
+    ]);*/
 
     let pa = pa::PortAudio::new().unwrap();
     println!("PortAudio version: {}", pa.version());

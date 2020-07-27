@@ -8,6 +8,8 @@ use portaudio as pa;
 use std::thread;
 use std::time;
 use std::f64::consts::PI;
+use std::time::Instant;
+use std::time::Duration;
 
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
@@ -443,27 +445,77 @@ impl SignalTransformer for DiffuseTransform {
     }
 }
 
+struct EnvelopeFunction {
+    transform_supplier: Box<Fn(Duration) -> Box<dyn SignalTransformer>>, // Function defined on [0;duration] interval
+    duration: Duration, // Domain of the envelope function
+}
+
 struct Envelope {
-    attack_filter_supplier: Box<Fn(f64) -> Filter>, // Function defined on [0;1] interval
-    attack_duration: f64, // Time it takes for attack filter to be called uniformly through [0;1]
+    attack: Option<EnvelopeFunction>,
+    decay: Option<EnvelopeFunction>,
+    sustain: Option<EnvelopeFunction>,
+    release: Option<EnvelopeFunction>
+}
 
-    sustain_filter_supplier: Box<Fn(f64) -> Filter>,
-    sustain_duration: f64,
+impl Envelope {
+    /**
+     * Current semantics:
+     *  - Jump straight to release phase when the key is released
+     *  - Repeat sustain as long as key is pressed
+     *  - If no sustain is specified, release will be played immediately after decay
+     */
+    fn evaluate_at_time(&self, press_timestamp: Instant, possible_release_timestamp: Option<Instant>) -> Option<Box<dyn SignalTransformer>> {
+        if let Some(release_timestamp) = possible_release_timestamp {
+            if let Some(release_func) = self.release {
+                let time_since_release = release_timestamp.elapsed();
+                if release_func.duration < time_since_release {
+                    return Some((release_func.transform_supplier)(time_since_release));
+                }
+            }
+            return None;
+        }
 
-    decay_filter_supplier: Box<Fn(f64) -> Filter>,
-    decay_duration: f64,
+        let mut elapsed_function_time = Duration::new(0, 0);
+        let time_since_press = press_timestamp.elapsed();
+
+        if let Some(attack_func) = self.attack {
+            if attack_func.duration > time_since_press {
+                return Some((attack_func.transform_supplier)(time_since_press));
+            }
+            elapsed_function_time += attack_func.duration;
+        }
+
+        if let Some(decay_func) = self.decay {
+            if decay_func.duration + elapsed_function_time > time_since_press {
+                return Some((decay_func.transform_supplier)(time_since_press - elapsed_function_time));
+            }
+            elapsed_function_time += decay_func.duration;
+        }
+
+        if let Some(sustain_func) = self.sustain {
+            let cycle_time = ((time_since_press - elapsed_function_time).as_nanos() as u64) % (sustain_func.duration.as_nanos() as u64);
+            return Some((sustain_func.transform_supplier)(Duration::from_nanos(cycle_time)));
+        }
+        if let Some(release_func) = self.release {
+            if release_func.duration + elapsed_function_time > time_since_press {
+                return Some((release_func.transform_supplier)(time_since_press - elapsed_function_time));
+            }
+        }
+
+        None
+    }
 }
 
 struct SignalPipeline {
-    transformers: Vec<Box<dyn SignalTransformer>>,
+    transformers: Vec<Box<Envelope>>,
 }
 
 impl SignalPipeline {
-    fn new(transformers: Vec<Box<dyn SignalTransformer>>) -> SignalPipeline {
+    fn new(transformers: Vec<Box<Envelope>>) -> SignalPipeline {
         SignalPipeline { transformers }
     }
 
-    fn process_one(&self, signal: &Signal) -> MaterializedSignal {
+    fn process_one(&self, signal: &Signal, time_since_press: f64, time_since_release: Option<f64>) -> Option<MaterializedSignal> {
         let mut transformed_signal = signal;
 
         let mut owner;
@@ -472,10 +524,10 @@ impl SignalPipeline {
             transformed_signal = &owner;
         }
 
-        MaterializedSignal {
+        Some(MaterializedSignal {
             frequency: transformed_signal.frequency,
             wave: transformed_signal.wave.materialize(),
-        }
+        })
     }
 }
 

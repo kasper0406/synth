@@ -246,7 +246,7 @@ fn test_iterative_fft() {
 }
 
 #[test]
-fn test_inverse_dft_naive() {
+fn test_inverse_dft() {
     let description = vec![
         SignalDescription { frequency: 6, amplitude: 1f64, offset: 0f64 },
         SignalDescription { frequency: 500, amplitude: 5f64, offset: 0.1337f64 },

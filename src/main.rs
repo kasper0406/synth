@@ -1,3 +1,5 @@
+#![feature(drain_filter)]
+
 extern crate portaudio;
 
 mod fft;
@@ -194,9 +196,7 @@ impl Drop for Synth {
 }
 
 impl Synth {
-    fn new(signal_receiver: mpsc::Receiver<MaterializedSignals>) -> Synth {
-        let is_running = Arc::new(AtomicBool::new(true));
-
+    fn new(is_running: Arc<AtomicBool>, signal_receiver: mpsc::Receiver<MaterializedSignals>) -> Synth {
         let gc_running = is_running.clone();
         let (gc_reclaim_send, gc_reclaim_recv) = mpsc::channel();
         let gc_thread = Some(thread::spawn(move || {
@@ -446,7 +446,7 @@ impl SignalTransformer for DiffuseTransform {
 }
 
 struct EnvelopeFunction {
-    transform_supplier: Box<Fn(Duration) -> Box<dyn SignalTransformer>>, // Function defined on [0;duration] interval
+    transform_supplier: Box<Fn(Duration) -> Arc<dyn SignalTransformer>>, // Function defined on [0;duration] interval
     duration: Duration, // Domain of the envelope function
 }
 
@@ -458,15 +458,28 @@ struct Envelope {
 }
 
 impl Envelope {
+
+    fn constant(transformer: Arc<dyn SignalTransformer>) -> Envelope {
+        Envelope {
+            attack: None,
+            decay: None,
+            sustain: Some(EnvelopeFunction {
+                duration: Duration::from_millis(1),
+                transform_supplier: Box::new(move |_duration| transformer.clone()),
+            }),
+            release: None,
+        }
+    }
+
     /**
      * Current semantics:
      *  - Jump straight to release phase when the key is released
      *  - Repeat sustain as long as key is pressed
      *  - If no sustain is specified, release will be played immediately after decay
      */
-    fn evaluate_at_time(&self, press_timestamp: Instant, possible_release_timestamp: Option<Instant>) -> Option<Box<dyn SignalTransformer>> {
+    fn evaluate_at_time(&self, press_timestamp: Instant, possible_release_timestamp: Option<Instant>) -> Option<Arc<dyn SignalTransformer>> {
         if let Some(release_timestamp) = possible_release_timestamp {
-            if let Some(release_func) = self.release {
+            if let Some(release_func) = &self.release {
                 let time_since_release = release_timestamp.elapsed();
                 if release_func.duration < time_since_release {
                     return Some((release_func.transform_supplier)(time_since_release));
@@ -478,25 +491,25 @@ impl Envelope {
         let mut elapsed_function_time = Duration::new(0, 0);
         let time_since_press = press_timestamp.elapsed();
 
-        if let Some(attack_func) = self.attack {
+        if let Some(attack_func) = &self.attack {
             if attack_func.duration > time_since_press {
                 return Some((attack_func.transform_supplier)(time_since_press));
             }
             elapsed_function_time += attack_func.duration;
         }
 
-        if let Some(decay_func) = self.decay {
+        if let Some(decay_func) = &self.decay {
             if decay_func.duration + elapsed_function_time > time_since_press {
                 return Some((decay_func.transform_supplier)(time_since_press - elapsed_function_time));
             }
             elapsed_function_time += decay_func.duration;
         }
 
-        if let Some(sustain_func) = self.sustain {
+        if let Some(sustain_func) = &self.sustain {
             let cycle_time = ((time_since_press - elapsed_function_time).as_nanos() as u64) % (sustain_func.duration.as_nanos() as u64);
             return Some((sustain_func.transform_supplier)(Duration::from_nanos(cycle_time)));
         }
-        if let Some(release_func) = self.release {
+        if let Some(release_func) = &self.release {
             if release_func.duration + elapsed_function_time > time_since_press {
                 return Some((release_func.transform_supplier)(time_since_press - elapsed_function_time));
             }
@@ -507,21 +520,33 @@ impl Envelope {
 }
 
 struct SignalPipeline {
-    transformers: Vec<Box<Envelope>>,
+    envelopes: Vec<Envelope>,
+}
+
+struct SignalIdentifier {
+    signal: Arc<Signal>,
+    press_timestamp: Instant,
+    possible_release_timestamp: Option<Instant>,
+    key_number: u16,
+    velocity: u16,
 }
 
 impl SignalPipeline {
-    fn new(transformers: Vec<Box<Envelope>>) -> SignalPipeline {
-        SignalPipeline { transformers }
+    fn new(envelopes: Vec<Envelope>) -> SignalPipeline {
+        SignalPipeline { envelopes }
     }
 
-    fn process_one(&self, signal: &Signal, time_since_press: f64, time_since_release: Option<f64>) -> Option<MaterializedSignal> {
-        let mut transformed_signal = signal;
+    fn process_one(&self, sid: &SignalIdentifier) -> Option<MaterializedSignal> {
+        let mut transformed_signal: &Signal = &sid.signal;
 
         let mut owner;
-        for transformer in self.transformers.iter() {
-            owner = transformer.transform(transformed_signal);
-            transformed_signal = &owner;
+        for envelope in self.envelopes.iter() {
+            if let Some(transformer) = envelope.evaluate_at_time(sid.press_timestamp, sid.possible_release_timestamp) {
+                owner = transformer.transform(&transformed_signal);
+                transformed_signal = &owner;
+            } else {
+                return None
+            }
         }
 
         Some(MaterializedSignal {
@@ -531,29 +556,100 @@ impl SignalPipeline {
     }
 }
 
-fn test_synth(sender: mpsc::Sender<MaterializedSignals>) {
-    let inputs = vec![
-        Signal {
-            frequency: 197.0,
+enum MidiEvent {
+    NoteOff { key_number: u16, timestamp: Instant },
+    NoteOn { key_number: u16, velocity: u16, timestamp: Instant  },
+}
+
+fn build_waves() -> Vec<Arc<Signal>> {
+    let mut result = Vec::with_capacity(88);
+    for i in 0..89 {
+        let frequency = 440.0f64 * (((i - 69 + 20) as f64) / 12f64).exp2();
+        result.push(Arc::new(Signal {
+            frequency: frequency,
             wave: AliasedWave::new(&SineWave {}, 512)
-        },
-    ];
-
-    let mut signals = vec![];
-
-    for input in inputs {
-        let pipeline = SignalPipeline::new(vec![
-            Box::new(OvertoneGenerator { overtone_levels: vec![0.34, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] }),
-            Box::new(BandwidthExpand { expand_exponent: 5 }),
-            Box::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 }),
-            Box::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 }),
-        ]);
-        signals.push(pipeline.process_one(&input));
+        }))
     }
+    result
+}
 
-    sender.send(MaterializedSignals { signals }).unwrap();
+fn synth_event_loop(is_running: Arc<AtomicBool>,
+                    key_receiver: mpsc::Receiver<MidiEvent>,
+                    sender: mpsc::Sender<MaterializedSignals>) {
+    // Setup pipeline
+    let pipeline = SignalPipeline::new(vec![
+        Envelope::constant(Arc::new(OvertoneGenerator { overtone_levels: vec![0.34, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] })),
+        Envelope::constant(Arc::new(BandwidthExpand { expand_exponent: 5 })),
+        Envelope::constant(Arc::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 })),
+        Envelope::constant(Arc::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 })),
+    ]);
 
-    thread::sleep(time::Duration::from_millis(2000));
+    // Pre-compute possible waves and signals
+    let waves = build_waves();
+
+    // Sounds processing loop
+    // TODO(knielsen): Add some metrics of how much is being processed
+    let mut signal_ids: Vec<SignalIdentifier> = vec![];
+    while (*is_running).load(Ordering::SeqCst) {
+        while let Ok(event) = key_receiver.try_recv() {
+            match event {
+                MidiEvent::NoteOn { key_number, velocity, .. } => {
+                    if signal_ids.iter().any(|sid| sid.key_number == key_number) {
+                        // TODO(knielsen): Probably a bad idea having io here, but probably fine for now as this is an edge case
+                        println!("Warning: Key that is already on is pressed again. Ignoring...");
+                    } else {
+                        assert!(key_number >= 21 && key_number <= 108, "Expected piano MIDI key range");
+                        let wave_number = (key_number - 21) as usize;
+                        signal_ids.push(SignalIdentifier {
+                            key_number,
+                            signal: waves[wave_number].clone(),
+                            velocity,
+                            press_timestamp: Instant::now(),
+                            possible_release_timestamp: None,
+                        });
+                    }
+                },
+                MidiEvent::NoteOff { key_number, .. } => {
+                    if let Some(sid) = signal_ids.iter_mut().find(|sid| sid.key_number == key_number) {
+                        sid.possible_release_timestamp = Some(Instant::now());
+                    }
+                }
+            }
+        }
+
+        let mut materialized_signals = vec![];
+        signal_ids.drain_filter(|sid| {
+            let processed = pipeline.process_one(&sid);
+            if let Some(materialized) = processed {
+                materialized_signals.push(materialized);
+                return false;
+            }
+            true
+        });
+
+        sender.send(MaterializedSignals { signals: materialized_signals }).unwrap();
+
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn play_something(midi_sender: mpsc::Sender<MidiEvent>) {
+    for i in 0..5 {
+        midi_sender.send(MidiEvent::NoteOn {
+            key_number: 50 + i,
+            velocity: 80,
+            timestamp: Instant::now(),
+        }).unwrap();
+
+        thread::sleep(Duration::from_millis(1000));
+
+        midi_sender.send(MidiEvent::NoteOff {
+            key_number: 50 + i,
+            timestamp: Instant::now(),
+        }).unwrap();
+
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn plot(waves: &[&Wave]) {
@@ -634,17 +730,29 @@ fn main() {
     let output_info = pa.device_info(output_device).unwrap();
     println!("Default output device info: {:#?}", &output_info);
 
+    let is_running = Arc::new(AtomicBool::new(true));
+
     // TODO(knielsen): Consider taking sample rate from output_info?
     let params = pa::stream::Parameters::new(output_device, CHANNELS as i32, INTERLEAVED, output_info.default_low_output_latency);
     let settings = pa::stream::OutputSettings::new(params, SAMPLE_RATE, FRAMES_PER_BUFFER);
 
     let (signal_sender, signal_receiver) = mpsc::channel();
-    let mut synth = Synth::new(signal_receiver);
+    let mut synth = Synth::new(is_running.clone(), signal_receiver);
 
     let mut stream = pa.open_non_blocking_stream(settings, move |args| synth.callback(args)).unwrap();
     stream.start().unwrap();
 
-    test_synth(signal_sender);
+    let (midi_event_sender, midi_event_receiver) = mpsc::channel();
+
+    let event_loop_running = is_running.clone();
+    let synth_loop = thread::spawn(move || {
+        synth_event_loop(event_loop_running, midi_event_receiver, signal_sender)
+    });
+
+    play_something(midi_event_sender);
+
+    is_running.store(false, Ordering::SeqCst);
+    synth_loop.join().unwrap();
 
     stream.stop().unwrap();
 }

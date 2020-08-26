@@ -20,6 +20,8 @@ use std::sync::atomic::Ordering;
 use std::thread::JoinHandle;
 use std::sync::mpsc;
 
+use std::collections::VecDeque;
+
 use gnuplot as plot;
 use gnuplot::AxesCommon;
 
@@ -27,7 +29,7 @@ const SAMPLE_RATE: f64 = 48_000.0;
 const FRAMES_PER_BUFFER: u32 = 64;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
-const VOLUME: f32 = 0.2;
+const VOLUME: f32 = 0.3;
 const LIMIT: f32 = 0.5;
 
 trait Wave {
@@ -119,27 +121,126 @@ impl AliasedWave {
     }
 }
 
+const OUTPUT_EPSILON: f64 = 0.05f64;
+const NUM_PHASES: usize = 128;
+
+struct PhaseManager {
+    phases: [f64; NUM_PHASES],
+
+    delta_indices: Vec<usize>,
+    delta_values: [f64; NUM_PHASES],
+}
+
+impl PhaseManager {
+    fn new() -> PhaseManager {
+        PhaseManager { 
+            phases: [0f64; NUM_PHASES],
+
+            delta_indices: Vec::with_capacity(NUM_PHASES),
+            delta_values: [0f64; NUM_PHASES],
+        }
+    }
+
+    fn increment(&mut self, idx: usize, delta: f64) {
+        if self.delta_values[idx] != 0f64 {
+            assert!(self.delta_values[idx] == delta, "Expected delta between signals to be identical. This may lead to weird sounds!");
+        } else {
+            self.delta_values[idx] = delta;
+            self.delta_indices.push(idx);
+        }
+    }
+
+    fn apply(&mut self) {
+        for idx_ref in &self.delta_indices {
+            let idx = *idx_ref;
+            self.phases[idx] = (self.phases[idx] + self.delta_values[idx]).fract();
+            self.delta_values[idx] = 0f64;
+        }
+        self.delta_indices.clear();
+    }
+
+    fn get_phase(&self, idx: usize) -> f64 {
+        self.phases[idx]
+    }
+
+    fn is_beginning(&self, idx: usize, epsilon: f64) -> bool {
+        self.get_phase(idx) < epsilon || self.get_phase(idx) > 1f64 - epsilon
+    }
+}
+
 struct MaterializedSignal {
     frequency: f64,
     wave: MemorizedWave,
+    phase_index: usize,
+
+    is_playing: bool,
+    should_stop: bool,
+    is_removable: bool,
 }
 
 impl MaterializedSignal {
+    fn new(frequency: f64, wave: MemorizedWave, phase_index: usize) -> MaterializedSignal {
+        MaterializedSignal {
+            frequency,
+            wave,
+            phase_index,
+
+            is_playing: false,
+            should_stop: false,
+            is_removable: true
+        }
+    }
+
     #[inline(always)]
-    fn sample(&self, sample_idx: u64, rate: f64) -> f64 {
-        let phase = ((sample_idx as f64) * self.frequency / rate).fract();
-        self.wave.sample(phase)
+    fn sample(&mut self, phases: &mut PhaseManager, sample_idx: u64, rate: f64) -> f64 {
+        if self.is_removable && self.should_stop {
+            return 0f64;
+        }
+
+        let phase_jump = self.frequency / rate;
+        phases.increment(self.phase_index, phase_jump);
+
+        let is_phase_beginning = phases.is_beginning(self.phase_index, phase_jump / 2f64);
+        let next_sample = self.wave.sample(phases.get_phase(self.phase_index));
+
+        if self.should_stop && is_phase_beginning {
+            self.is_removable = true;
+            self.is_playing = false;
+            return 0f64;
+        }
+
+        if !self.is_playing && !is_phase_beginning {
+            self.is_removable = true;
+            return 0f64;
+        }
+
+        self.is_playing = true;
+        self.is_removable = false;
+        
+        next_sample
     }
 }
 
 impl Drop for MaterializedSignal {
     fn drop(&mut self) {
-        println!("Dropping materialized signal at freq {}", self.frequency);
+        // println!("Dropping materialized signal at freq {}", self.frequency);
     }
 }
 
 struct MaterializedSignals {
     signals: Vec<MaterializedSignal>,
+}
+
+impl MaterializedSignals {
+    fn signal_stop(&mut self) {
+        for signal in &mut self.signals {
+            signal.should_stop = true;
+        }
+    }
+
+    fn is_playback_finished(&self) -> bool {
+        self.signals.iter().all(|signal| signal.is_removable)
+    }
 }
 
 macro_rules! join_thread {
@@ -174,6 +275,8 @@ struct Synth {
     // Signal handling
     signal_receiver: mpsc::Receiver<MaterializedSignals>,
     current_signal: MaterializedSignals,
+    orphan_signals: VecDeque<MaterializedSignals>,
+    phases: PhaseManager,
 
     // Signal cleanup handling
     gc_thread: Option<JoinHandle<()>>,
@@ -238,6 +341,8 @@ impl Synth {
             sample_count: 0,
             signal_receiver,
             current_signal: zero_signal,
+            orphan_signals: VecDeque::with_capacity(50),
+            phases: PhaseManager::new(),
             is_running,
             gc_thread,
             gc_reclaim_send,
@@ -253,15 +358,37 @@ impl Synth {
         let buffer = args.buffer;
 
         if let Ok(mut new_signal) = self.signal_receiver.try_recv() {
+            if self.orphan_signals.len() == self.orphan_signals.capacity() {
+                // We need to accept some popping and get rid of the oldest orphaned signals
+                // If this happen we should increase the orphaned_signals queue.
+                self.gc_reclaim_send.send(self.orphan_signals.pop_back().unwrap()).unwrap();
+                panic!("Increase orphan_signals queue size!");
+            }
+            self.current_signal.signal_stop();
             std::mem::swap(&mut self.current_signal, &mut new_signal);
-            self.gc_reclaim_send.send(new_signal).unwrap();
+            self.orphan_signals.push_front(new_signal);
+        }
+
+        while let Some(orphan) = self.orphan_signals.back() {
+            if !orphan.is_playback_finished() {
+                break;
+            }
+            self.gc_reclaim_send.send(self.orphan_signals.pop_back().unwrap()).unwrap();
         }
 
         for i in 0..frames {
             let mut output = 0f64;
-            for signal in &self.current_signal.signals {
-                output += signal.sample(self.sample_count, SAMPLE_RATE);
+            for signal in &mut self.current_signal.signals {
+                output += signal.sample(&mut self.phases, self.sample_count, SAMPLE_RATE);
             }
+
+            for orphan in &mut self.orphan_signals {
+                for signal in &mut orphan.signals {
+                    output += signal.sample(&mut self.phases, self.sample_count, SAMPLE_RATE);
+                }
+            }
+
+            self.phases.apply();
 
             buffer[i * 2] = output as f32;
             buffer[i * 2 + 1] = output as f32;
@@ -294,14 +421,12 @@ impl Synth {
 struct Signal {
     wave: AliasedWave,
     frequency: f64,
+    phase_index: usize,
 }
 
 impl Signal {
     fn materialize(&self) -> MaterializedSignal {
-        MaterializedSignal {
-            frequency: self.frequency,
-            wave: self.wave.materialize()
-        }
+        MaterializedSignal::new(self.frequency, self.wave.materialize(), self.phase_index)
     }
 }
 
@@ -327,6 +452,7 @@ impl<T: Filter> SignalTransformer for T {
         Signal {
             wave: AliasedWave::from_coefficients(coefficients),
             frequency: signal.frequency,
+            phase_index: signal.phase_index,
         }
     }
 }
@@ -395,6 +521,7 @@ impl SignalTransformer for OvertoneGenerator {
         Signal {
             wave: AliasedWave::from_coefficients(coefficients),
             frequency: signal.frequency / 2.0,
+            phase_index: signal.phase_index,
         }
     }
 }
@@ -415,6 +542,7 @@ impl SignalTransformer for BandwidthExpand {
         Signal {
             wave: AliasedWave::from_coefficients(coefficients),
             frequency: signal.frequency / (expand_factor as f64),
+            phase_index: signal.phase_index,
         }
     }
 }
@@ -441,6 +569,7 @@ impl SignalTransformer for DiffuseTransform {
         Signal {
             wave: AliasedWave::from_coefficients(prev),
             frequency: signal.frequency,
+            phase_index: signal.phase_index,
         }
     }
 }
@@ -549,10 +678,11 @@ impl SignalPipeline {
             }
         }
 
-        Some(MaterializedSignal {
-            frequency: transformed_signal.frequency,
-            wave: transformed_signal.wave.materialize(),
-        })
+        Some(MaterializedSignal::new(
+            transformed_signal.frequency,
+            transformed_signal.wave.materialize(),
+            transformed_signal.phase_index
+        ))
     }
 }
 
@@ -564,10 +694,11 @@ enum MidiEvent {
 fn build_waves() -> Vec<Arc<Signal>> {
     let mut result = Vec::with_capacity(88);
     for i in 0..89 {
-        let frequency = 440.0f64 * (((i - 69 + 20) as f64) / 12f64).exp2();
+        let frequency = 440.0f64 * ((((i as f64) - 69f64 + 20f64) as f64) / 12f64).exp2();
         result.push(Arc::new(Signal {
             frequency: frequency,
-            wave: AliasedWave::new(&SineWave {}, 512)
+            wave: AliasedWave::new(&SineWave {}, 1024),
+            phase_index: i,
         }))
     }
     result
@@ -580,7 +711,7 @@ fn synth_event_loop(is_running: Arc<AtomicBool>,
     let pipeline = SignalPipeline::new(vec![
         Envelope::constant(Arc::new(OvertoneGenerator { overtone_levels: vec![0.34, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] })),
         Envelope::constant(Arc::new(BandwidthExpand { expand_exponent: 5 })),
-        Envelope::constant(Arc::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 })),
+        // Envelope::constant(Arc::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 })),
         Envelope::constant(Arc::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 })),
     ]);
 
@@ -629,7 +760,7 @@ fn synth_event_loop(is_running: Arc<AtomicBool>,
 
         sender.send(MaterializedSignals { signals: materialized_signals }).unwrap();
 
-        thread::sleep(Duration::from_millis(1));
+        thread::sleep(Duration::from_millis(10));
     }
 }
 
@@ -648,7 +779,7 @@ fn play_something(midi_sender: mpsc::Sender<MidiEvent>) {
             timestamp: Instant::now(),
         }).unwrap();
 
-        thread::sleep(Duration::from_millis(100));
+        thread::sleep(Duration::from_millis(20));
     }
 }
 

@@ -1,4 +1,4 @@
-#![feature(drain_filter)]
+#![feature(drain_filter,div_duration)]
 
 extern crate portaudio;
 
@@ -26,7 +26,7 @@ use gnuplot as plot;
 use gnuplot::AxesCommon;
 
 const SAMPLE_RATE: f64 = 48_000.0;
-const FRAMES_PER_BUFFER: u32 = 64;
+const FRAMES_PER_BUFFER: u32 = 16;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
 const VOLUME: f32 = 0.3;
@@ -457,6 +457,16 @@ impl<T: Filter> SignalTransformer for T {
     }
 }
 
+struct AmplitudeTransformer {
+    amplitude: f64
+}
+
+impl Filter for AmplitudeTransformer {
+    fn apply(&self, frequency: f64) -> f64 {
+        self.amplitude
+    }
+}
+
 struct LowpassFilter {
     cutoff: f64,
 }
@@ -589,14 +599,55 @@ struct Envelope {
 impl Envelope {
 
     fn constant(transformer: Arc<dyn SignalTransformer>) -> Envelope {
+        let transformer_sustain = transformer.clone();
+        let transformer_release = transformer.clone();
+
         Envelope {
             attack: None,
             decay: None,
             sustain: Some(EnvelopeFunction {
                 duration: Duration::from_millis(1),
-                transform_supplier: Box::new(move |_duration| transformer.clone()),
+                transform_supplier: Box::new(move |_duration| transformer_sustain.clone()),
             }),
-            release: None,
+            release: Some(EnvelopeFunction {
+                duration: Duration::from_secs(3600),
+                transform_supplier: Box::new(move |_duration| transformer_release.clone()),
+            }),
+        }
+    }
+
+    fn linear_amplitude(attack_duration: Duration, attack_amp: f64,
+                        decay_duration: Duration, decay_amp: f64,
+                        release_duration: Duration) -> Envelope {
+        let interpolate = |current_duration: Duration, phase_duration: Duration, from, to| {
+            from + (to - from) * current_duration.div_duration_f64(phase_duration)
+        };
+
+        Envelope {
+            attack: Some(EnvelopeFunction {
+                duration: attack_duration,
+                transform_supplier: Box::new(move |duration| Arc::new(AmplitudeTransformer {
+                    amplitude: interpolate(duration, attack_duration, 0f64, attack_amp)
+                }))
+            }),
+            decay: Some(EnvelopeFunction {
+                duration: decay_duration,
+                transform_supplier: Box::new(move |duration| Arc::new(AmplitudeTransformer {
+                    amplitude: interpolate(duration, decay_duration, attack_amp, decay_amp)
+                }))
+            }),
+            sustain: Some(EnvelopeFunction {
+                duration: Duration::from_millis(1),
+                transform_supplier: Box::new(move |_duration| Arc::new(AmplitudeTransformer {
+                    amplitude: decay_amp
+                }))
+            }),
+            release: Some(EnvelopeFunction {
+                duration: release_duration,
+                transform_supplier: Box::new(move |duration| Arc::new(AmplitudeTransformer {
+                    amplitude: interpolate(duration, release_duration, decay_amp, 0f64)
+                }))
+            }),
         }
     }
 
@@ -610,7 +661,8 @@ impl Envelope {
         if let Some(release_timestamp) = possible_release_timestamp {
             if let Some(release_func) = &self.release {
                 let time_since_release = release_timestamp.elapsed();
-                if release_func.duration < time_since_release {
+                // println!("Inside release function: {:?} < {:?} = {:?}", time_since_release, release_func.duration, time_since_release < release_func.duration);
+                if time_since_release < release_func.duration {
                     return Some((release_func.transform_supplier)(time_since_release));
                 }
             }
@@ -709,8 +761,13 @@ fn synth_event_loop(is_running: Arc<AtomicBool>,
                     sender: mpsc::Sender<MaterializedSignals>) {
     // Setup pipeline
     let pipeline = SignalPipeline::new(vec![
-        Envelope::constant(Arc::new(OvertoneGenerator { overtone_levels: vec![0.34, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] })),
-        Envelope::constant(Arc::new(BandwidthExpand { expand_exponent: 5 })),
+        Envelope::linear_amplitude(
+            Duration::from_millis(300), 1.0,
+            Duration::from_millis(200), 0.8,
+            Duration::from_millis(100)
+        ),
+        // Envelope::constant(Arc::new(OvertoneGenerator { overtone_levels: vec![0.0, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] })),
+        // Envelope::constant(Arc::new(BandwidthExpand { expand_exponent: 5 })),
         // Envelope::constant(Arc::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 })),
         Envelope::constant(Arc::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 })),
     ]);
@@ -772,14 +829,14 @@ fn play_something(midi_sender: mpsc::Sender<MidiEvent>) {
             timestamp: Instant::now(),
         }).unwrap();
 
-        thread::sleep(Duration::from_millis(1000));
+        thread::sleep(Duration::from_millis(2000));
 
         midi_sender.send(MidiEvent::NoteOff {
             key_number: 50 + i,
             timestamp: Instant::now(),
         }).unwrap();
 
-        thread::sleep(Duration::from_millis(20));
+        thread::sleep(Duration::from_millis(1000));
     }
 }
 

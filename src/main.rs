@@ -29,7 +29,7 @@ const SAMPLE_RATE: f64 = 48_000.0;
 const FRAMES_PER_BUFFER: u32 = 0;
 const CHANNELS: usize = 2;
 const INTERLEAVED: bool = true;
-const VOLUME: f32 = 0.3;
+const VOLUME: f32 = 0.5;
 const LIMIT: f32 = 0.5;
 
 trait Wave {
@@ -121,7 +121,6 @@ impl AliasedWave {
     }
 }
 
-const OUTPUT_EPSILON: f64 = 0.05f64;
 const NUM_PHASES: usize = 128;
 
 struct PhaseManager {
@@ -129,6 +128,8 @@ struct PhaseManager {
 
     delta_indices: Vec<usize>,
     delta_values: [f64; NUM_PHASES],
+
+
 }
 
 impl PhaseManager {
@@ -159,6 +160,21 @@ impl PhaseManager {
         self.delta_indices.clear();
     }
 
+    fn reset_unused_phases(&mut self, prev: &MaterializedSignals, new: &MaterializedSignals) {
+        for prev_signal in &prev.signals {
+            let mut exists = false;
+            for new_signal in &new.signals {
+                if new_signal.phase_index == prev_signal.phase_index {
+                    exists = true;
+                    break;
+                }
+            }
+            if !exists {
+                self.phases[prev_signal.phase_index] = 0f64;
+            }
+        }
+    }
+
     fn get_phase(&self, idx: usize) -> f64 {
         self.phases[idx]
     }
@@ -172,10 +188,6 @@ struct MaterializedSignal {
     frequency: f64,
     wave: MemorizedWave,
     phase_index: usize,
-
-    is_playing: bool,
-    should_stop: bool,
-    is_removable: bool,
 }
 
 impl MaterializedSignal {
@@ -184,40 +196,15 @@ impl MaterializedSignal {
             frequency,
             wave,
             phase_index,
-
-            is_playing: false,
-            should_stop: false,
-            is_removable: true
         }
     }
 
     #[inline(always)]
     fn sample(&mut self, phases: &mut PhaseManager, sample_idx: u64, rate: f64) -> f64 {
-        if self.is_removable && self.should_stop {
-            return 0f64;
-        }
-
         let phase_jump = self.frequency / rate;
         phases.increment(self.phase_index, phase_jump);
-
-        let is_phase_beginning = phases.is_beginning(self.phase_index, phase_jump / 2f64);
-        let next_sample = self.wave.sample(phases.get_phase(self.phase_index));
-
-        if self.should_stop && is_phase_beginning {
-            self.is_removable = true;
-            self.is_playing = false;
-            return 0f64;
-        }
-
-        if !self.is_playing && !is_phase_beginning {
-            self.is_removable = true;
-            return 0f64;
-        }
-
-        self.is_playing = true;
-        self.is_removable = false;
         
-        next_sample
+        self.wave.sample(phases.get_phase(self.phase_index))
     }
 }
 
@@ -229,18 +216,6 @@ impl Drop for MaterializedSignal {
 
 struct MaterializedSignals {
     signals: Vec<MaterializedSignal>,
-}
-
-impl MaterializedSignals {
-    fn signal_stop(&mut self) {
-        for signal in &mut self.signals {
-            signal.should_stop = true;
-        }
-    }
-
-    fn is_playback_finished(&self) -> bool {
-        self.signals.iter().all(|signal| signal.is_removable)
-    }
 }
 
 macro_rules! join_thread {
@@ -275,7 +250,6 @@ struct Synth {
     // Signal handling
     signal_receiver: mpsc::Receiver<MaterializedSignals>,
     current_signal: MaterializedSignals,
-    orphan_signals: VecDeque<MaterializedSignals>,
     phases: PhaseManager,
 
     // Signal cleanup handling
@@ -341,7 +315,6 @@ impl Synth {
             sample_count: 0,
             signal_receiver,
             current_signal: zero_signal,
-            orphan_signals: VecDeque::with_capacity(50),
             phases: PhaseManager::new(),
             is_running,
             gc_thread,
@@ -358,34 +331,15 @@ impl Synth {
         let buffer = args.buffer;
 
         if let Ok(mut new_signal) = self.signal_receiver.try_recv() {
-            if self.orphan_signals.len() == self.orphan_signals.capacity() {
-                // We need to accept some popping and get rid of the oldest orphaned signals
-                // If this happen we should increase the orphaned_signals queue.
-                self.gc_reclaim_send.send(self.orphan_signals.pop_back().unwrap()).unwrap();
-                panic!("Increase orphan_signals queue size!");
-            }
-            self.current_signal.signal_stop();
+            self.phases.reset_unused_phases(&self.current_signal, &new_signal);
             std::mem::swap(&mut self.current_signal, &mut new_signal);
-            self.orphan_signals.push_front(new_signal);
-        }
-
-        while let Some(orphan) = self.orphan_signals.back() {
-            if !orphan.is_playback_finished() {
-                break;
-            }
-            self.gc_reclaim_send.send(self.orphan_signals.pop_back().unwrap()).unwrap();
+            self.gc_reclaim_send.send(new_signal).unwrap();
         }
 
         for i in 0..frames {
             let mut output = 0f64;
             for signal in &mut self.current_signal.signals {
                 output += signal.sample(&mut self.phases, self.sample_count, SAMPLE_RATE);
-            }
-
-            for orphan in &mut self.orphan_signals {
-                for signal in &mut orphan.signals {
-                    output += signal.sample(&mut self.phases, self.sample_count, SAMPLE_RATE);
-                }
             }
 
             self.phases.apply();
@@ -762,13 +716,11 @@ fn synth_event_loop(is_running: Arc<AtomicBool>,
     // Setup pipeline
     let pipeline = SignalPipeline::new(vec![
         Envelope::linear_amplitude(
-            Duration::from_millis(300), 1.0,
+            Duration::from_millis(20), 1.0,
             Duration::from_millis(200), 0.8,
-            Duration::from_millis(100)
+            Duration::from_millis(60)
         ),
         // Envelope::constant(Arc::new(OvertoneGenerator { overtone_levels: vec![0.0, 0.57, 0.69, 0.34, 0.34, 0.28, 0.34, 0.46, 0.24, 0.34, 0.24 ] })),
-        // Envelope::constant(Arc::new(BandwidthExpand { expand_exponent: 5 })),
-        // Envelope::constant(Arc::new(DiffuseTransform { iterations: 2, leak_amount: 0.05 })),
         Envelope::constant(Arc::new(LowpassFilter { cutoff: SAMPLE_RATE / 2.0 })),
     ]);
 

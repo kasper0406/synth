@@ -22,7 +22,7 @@ impl Component for App {
 
     fn view(&self) -> Html {
         html! {
-            <div>
+            <div style="-webkit-user-select: none; cursor: default;">
                 <h1>{ "Hello, World from Rust xD!" }</h1>
             </div>
         }

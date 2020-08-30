@@ -1,0 +1,17 @@
+{
+  "name": "synth",
+  "version": "1.0.0",
+  "main": "index.js",
+  "repository": "git@github.com:kasper0406/synth.git",
+  "author": "Kasper Nielsen <kasper0406@gmail.com>",
+  "license": "MIT",
+  "scripts": {
+    "start": "parcel app/index.html --open",
+    "build": "parcel build app/index.html"
+  },
+  "dependencies": {},
+  "devDependencies": {
+    "parcel-bundler": "^1.9.4",
+    "parcel-plugin-wasm.rs": "^1.2.16"
+  }
+}

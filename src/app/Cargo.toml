@@ -1,0 +1,17 @@
+[package]
+name = "synth"
+version = "0.1.0"
+authors = ["Kasper Nielsen <kasper0406@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+web-view = "0.5.4"
+rust-embed = "5.6.0"
+actix-web = "2.0"
+actix-rt = "1.1.1"
+mime_guess = "2.0.3"
+futures = "0.3"
+
+[[bin]]
+name = "app"
+path = "main.rs"

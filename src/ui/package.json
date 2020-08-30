@@ -11,7 +11,7 @@
   },
   "dependencies": {},
   "devDependencies": {
-    "parcel-bundler": "^1.9.4",
+    "parcel-bundler": "1.x",
     "parcel-plugin-wasm.rs": "^1.2.16",
     "wasm-pack": "0.9.1"
   }

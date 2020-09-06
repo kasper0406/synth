@@ -6,8 +6,8 @@
   "author": "Kasper Nielsen <kasper0406@gmail.com>",
   "license": "MIT",
   "scripts": {
-    "start": "parcel app/index.html --open",
-    "build": "parcel build app/index.html"
+    "start": "parcel app/index.html app/synth.js --open",
+    "build": "parcel build app/index.html app/synth.js"
   },
   "dependencies": {},
   "devDependencies": {

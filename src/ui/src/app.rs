@@ -12,8 +12,9 @@ pub struct App {
 
 }
 
-#[wasm_bindgen(js_namespace = window)]
+#[wasm_bindgen]
 extern "C" {
+    #[wasm_bindgen(js_namespace = ["window", "synth"])]
     fn setup_audio();
 }
 

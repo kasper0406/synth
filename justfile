@@ -3,6 +3,6 @@ build:
     cd src/ui/ && yarn build
     cd src/app/ && cargo build
 
-run:
+start:
     just build
-    cd src/app/ && cargo run
+    cd src/ui/ && yarn start

@@ -1,14 +1,25 @@
+const rust = import("./pkg");
+
 export function setup_audio() {
     console.log("Setting up audio hook...");
 
     var audioCode = `
-        class SynthProcessor extends AudioWorkletProcessor {
-            process (inputs, outputs, parameters) {
-                const output = outputs[0];
-                // synth_callback(output);
-                console.log(output);
+        console.log('Inside audio setup code');
 
-                debugger;
+        class SynthProcessor extends AudioWorkletProcessor {
+            constructor() {
+                super();
+                import("./pkg").then(rust => {
+                    console.log("Loaded rust module in audio worklet");
+                });
+            }
+
+            process (inputs, outputs, parameters) {
+                // const output = outputs[0];
+                window.m_rust.synth_callback();
+                // console.log(output);
+
+                // debugger;
 
                 return true;
             }
@@ -20,14 +31,20 @@ export function setup_audio() {
     var blob = new Blob([audioCode], { type: 'text/javascript' });
     var workerUrl = URL.createObjectURL(blob);
 
-    const audioContext = new AudioContext()
+    const audioContext = new AudioContext();
     audioContext.audioWorklet.addModule(workerUrl).then(_ => {
         const whiteNoiseNode = new AudioWorkletNode(audioContext, "synth-processor");
         whiteNoiseNode.connect(audioContext.destination);
     });
 };
 
-import("./pkg").then(rust => {
+rust.then(rust => {
     console.log("Initializing rust code");
+
+    // TODO(knielsen): Consider passing this through the run function instead
+    //                 or somehow set it with a setter function on the rust module
+    // window.m_rust = {};
+    // window.m_rust.synth_callback = rust.synth_callback;
+
     rust.run();
 });

@@ -6,13 +6,20 @@
   "author": "Kasper Nielsen <kasper0406@gmail.com>",
   "license": "MIT",
   "scripts": {
-    "start": "parcel app/index.html app/synth.js --open",
-    "build": "parcel build app/index.html app/synth.js"
+    "build": "webpack",
+    "start": "webpack-dev-server --open",
+    "watch": "webpack --watch"
   },
   "dependencies": {},
   "devDependencies": {
-    "parcel-bundler": "1.x",
-    "parcel-plugin-wasm.rs": "^1.2.16",
-    "wasm-pack": "0.9.1"
-  }
+    "@wasm-tool/wasm-pack-plugin": "1.3.1",
+    "html-webpack-plugin": "4.4.1",
+    "text-encoding": "0.7.0",
+    "webpack": "^4.44.1",
+    "webpack-cli": "^3.3.12",
+    "webpack-dev-server": "3.11.0"
+  },
+  "browserslist": [
+    "last 1 Chrome version"
+  ]
 }

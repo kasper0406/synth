@@ -17,7 +17,7 @@ use std::thread;
 use futures::executor::block_on;
 
 #[derive(RustEmbed)]
-#[folder = "../ui/dist"]
+#[folder = "../ui/crate/pkg"]
 struct Asset;
 
 fn assets(req: HttpRequest) -> HttpResponse {

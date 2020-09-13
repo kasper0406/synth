@@ -1,4 +1,10 @@
 const rust = import("./pkg");
+const minimal = import("../minimal/pkg/minimal")
+
+console.log("Defining functions...");
+export function hi() {
+    console.log("Hello!");
+}
 
 export function setup_audio() {
     console.log("Setting up audio hook...");
@@ -28,14 +34,19 @@ export function setup_audio() {
         registerProcessor("synth-processor", SynthProcessor);
     `;
 
+    // minimal.init();
+
+        /*
     var blob = new Blob([audioCode], { type: 'text/javascript' });
     var workerUrl = URL.createObjectURL(blob);
+
+    console.log("Filename", __filename);
 
     const audioContext = new AudioContext();
     audioContext.audioWorklet.addModule(workerUrl).then(_ => {
         const whiteNoiseNode = new AudioWorkletNode(audioContext, "synth-processor");
         whiteNoiseNode.connect(audioContext.destination);
-    });
+    });*/
 };
 
 rust.then(rust => {

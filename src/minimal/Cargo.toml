@@ -1,0 +1,28 @@
+[package]
+name = "minimal"
+version = "0.1.0"
+authors = ["Kasper Nielsen <kasper0406@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+wasm-bindgen = "0.2"
+wasm-bindgen-futures = "0.4.17"
+console_error_panic_hook = "0.1.6"
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies.web-sys]
+version = "0.3.4"
+features = [
+    'console',
+    'AudioContext',
+    'AudioBuffer',
+    'AudioBufferSourceNode',
+    'AudioDestinationNode',
+    'BlobPropertyBag',
+    'Blob',
+    'Url',
+    'AudioWorklet',
+    'AudioWorkletNode',
+]

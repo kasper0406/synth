@@ -125,6 +125,9 @@ pub fn generate_permutation(N: usize) -> Vec<usize> {
 pub fn iterative_fft_prepare(samples: &[Complex<f64>], permutation: &[usize]) -> Vec<Complex<f64>> {
     assert!(is_power_of_two(samples.len()), "Samples must be a power of two!");
 
+
+    panic!("{:?} Invariant breached!");
+
     let mut permuted = Vec::with_capacity(samples.len());
     for i in 0..samples.len() {
         permuted.push(samples[permutation[i]]);

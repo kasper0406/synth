@@ -1,10 +1,7 @@
-const rust = import("./pkg");
-const minimal = import("../minimal/pkg/minimal")
+// const rust = import("./pkg");
+const minimalLoader = import("../minimal/pkg/minimal")
 
 console.log("Defining functions...");
-export function hi() {
-    console.log("Hello!");
-}
 
 export function setup_audio() {
     console.log("Setting up audio hook...");
@@ -13,19 +10,30 @@ export function setup_audio() {
         console.log('Inside audio setup code');
 
         class SynthProcessor extends AudioWorkletProcessor {
-            constructor() {
-                super();
-                import("./pkg").then(rust => {
-                    console.log("Loaded rust module in audio worklet");
-                });
+            constructor(...args) {
+                super(...args);
+                console.log("Inside SynthProcessor...");
+
+                this.port.onmessage = (e) => {
+                    let wasmBytes = e.data;
+                    console.log("Received WASM bytes", wasmBytes);
+
+                    var importObject = {
+                        imports: {
+
+                        }
+                    }
+                    WebAssembly.instantiate(wasmBytes, importObject).then(rust => {
+                        console.log("Loaded rust wasm xD");
+                        this.rust = rust.instance.exports;
+                    });
+                };
             }
 
             process (inputs, outputs, parameters) {
-                // const output = outputs[0];
-                window.m_rust.synth_callback();
-                // console.log(output);
-
-                // debugger;
+                if (this.rust !== undefined) {
+                    this.rust.synth_callback(outputs);
+                }
 
                 return true;
             }
@@ -36,26 +44,20 @@ export function setup_audio() {
 
     // minimal.init();
 
-        /*
     var blob = new Blob([audioCode], { type: 'text/javascript' });
     var workerUrl = URL.createObjectURL(blob);
 
     console.log("Filename", __filename);
+    let wasmLoader = fetch("da8817554716fd3bb361.module.wasm");
 
     const audioContext = new AudioContext();
     audioContext.audioWorklet.addModule(workerUrl).then(_ => {
-        const whiteNoiseNode = new AudioWorkletNode(audioContext, "synth-processor");
-        whiteNoiseNode.connect(audioContext.destination);
-    });*/
+        const synthNode = new AudioWorkletNode(audioContext, "synth-processor");
+        synthNode.connect(audioContext.destination);
+
+        wasmLoader.then(response => response.arrayBuffer())
+            .then(bytes => {
+                synthNode.port.postMessage(bytes);
+            })
+    });
 };
-
-rust.then(rust => {
-    console.log("Initializing rust code");
-
-    // TODO(knielsen): Consider passing this through the run function instead
-    //                 or somehow set it with a setter function on the rust module
-    // window.m_rust = {};
-    // window.m_rust.synth_callback = rust.synth_callback;
-
-    rust.run();
-});

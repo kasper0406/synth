@@ -60,8 +60,3 @@ pub fn run() {
 
     yew::start_app::<SynthRouter>();
 }
-
-#[wasm_bindgen]
-pub fn synth_callback() {
-    ws::console::log_1(&"Inside synth callback in Rust!".into());
-}

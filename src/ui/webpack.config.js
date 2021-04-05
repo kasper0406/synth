@@ -20,11 +20,20 @@ module.exports = {
             title: 'TubeSynth',
         }),
         new WasmPackPlugin({
-            crateDirectory: path.resolve(__dirname, "minimal")
+            crateDirectory: path.resolve(__dirname, ".")
         })
     ],
     mode: 'development',
     experiments: {
-        asyncWebAssembly: true
+        syncWebAssembly: true
+    },
+    module: {
+        rules: [
+            {
+                test: /synth_wasm_bg\.wasm$/i,
+                type: 'javascript/auto',
+                loader: 'arraybuffer-loader'
+            }
+        ]
     }
 };

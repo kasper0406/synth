@@ -1,5 +1,5 @@
 [package]
-name = "minimal"
+name = "synth_wasm"
 version = "0.1.0"
 authors = ["Kasper Nielsen <kasper0406@gmail.com>"]
 edition = "2018"
